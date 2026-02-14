@@ -121,7 +121,8 @@ sample_metadata <- sample_metadata_raw %>%
   ) %>%
   filter(Sample %in% asv_table_raw$Sample)
 
-write_tsv(sample_metadata, here(derived_dir, "sample_metadata_prepared.tsv"))
+sample_metadata %>%
+  write_tsv(here(derived_dir, "sample_metadata_prepared.tsv"))
 
 sample_metadata %>%
   count(Type, season, SizeFrac, sort = TRUE)
@@ -143,7 +144,8 @@ sample_read_summary <- asv_table_raw %>%
   left_join(sample_metadata, by = "Sample") %>%
   left_join(dna_concentration, by = "Sample")
 
-write_tsv(sample_read_summary, here(derived_dir, "sample_read_summary.tsv"))
+sample_read_summary %>%
+  write_tsv(here(derived_dir, "sample_read_summary.tsv"))
 
 plot_reads_rank <- sample_read_summary %>%
   arrange(desc(total_reads)) %>%
@@ -214,9 +216,12 @@ asv_table_clean <- asv_table_raw %>%
 taxonomy_table_clean <- taxonomy_table_raw %>%
   filter(seq %in% colnames(asv_table_clean))
 
-write_tsv(tibble(seq_removed = sequences_to_remove), here(derived_dir, "removed_sequences.tsv"))
-write_tsv(asv_table_clean, here(derived_dir, "asv_table_clean.tsv"))
-write_tsv(taxonomy_table_clean, here(derived_dir, "taxonomy_table_clean.tsv"))
+tibble(seq_removed = sequences_to_remove) %>%
+  write_tsv(here(derived_dir, "removed_sequences.tsv"))
+asv_table_clean %>%
+  write_tsv(here(derived_dir, "asv_table_clean.tsv"))
+taxonomy_table_clean %>%
+  write_tsv(here(derived_dir, "taxonomy_table_clean.tsv"))
 
 tibble(
   metric = c("raw_sequences", "removed_sequences", "clean_sequences"),
@@ -252,7 +257,8 @@ ngi_taxa_distribution <- asv_table_clean %>%
   group_by(Sample, rank, taxa, season, probability) %>%
   summarise(n_otu = n(), .groups = "drop")
 
-write_tsv(ngi_taxa_distribution, here(derived_dir, "ngi_taxa_distribution.tsv"))
+ngi_taxa_distribution %>%
+  write_tsv(here(derived_dir, "ngi_taxa_distribution.tsv"))
 ```
 
 ```{r phylum-plot}
@@ -273,7 +279,8 @@ phylum_label_df <- ngi_phylum_relative %>%
   distinct(SizeFrac, season, total_otu) %>%
   mutate(total_otu = round(total_otu), y = 0.5)
 
-write_tsv(ngi_phylum_relative, here(derived_dir, "ngi_relative_phylum_abundance.tsv"))
+ngi_phylum_relative %>%
+  write_tsv(here(derived_dir, "ngi_relative_phylum_abundance.tsv"))
 
 plot_phylum <- ngi_phylum_relative %>%
   ggplot(aes(SizeFrac, relative_otu, fill = taxa)) +
@@ -332,7 +339,8 @@ for (phylum_name in main_phyla) {
 rarefaction_df <- bind_rows(rarefaction_list) %>%
   rename(size = Sample, Sample = Site)
 
-write_tsv(rarefaction_df, here(derived_dir, "rarefaction_curves.tsv"))
+rarefaction_df %>%
+  write_tsv(here(derived_dir, "rarefaction_curves.tsv"))
 
 plot_rarefaction <- rarefaction_df %>%
   left_join(sample_metadata, by = "Sample") %>%
@@ -379,7 +387,8 @@ for (phylum_name in main_phyla) {
 
 diversity_estimates <- bind_rows(diversity_estimate_list)
 
-write_tsv(diversity_estimates, here(derived_dir, "diversity_estimates_iNEXT.tsv"))
+diversity_estimates %>%
+  write_tsv(here(derived_dir, "diversity_estimates_iNEXT.tsv"))
 ```
 
 ## 8) Richness trends by size class, season, and DNA concentration
@@ -431,7 +440,8 @@ diversity_model_anova <- Anova(diversity_model, type = 2) %>%
   tidy() %>%
   mutate(across(where(is.numeric), ~ signif(.x, 3)))
 
-write_tsv(diversity_model_anova, here(derived_dir, "diversity_model_anova.tsv"))
+diversity_model_anova %>%
+  write_tsv(here(derived_dir, "diversity_model_anova.tsv"))
 
 diversity_model_anova
 ```
@@ -454,7 +464,8 @@ ngi_nmds <- vegan::metaMDS(asv_ngi_matrix, distance = "bray", autotransform = TR
 nmds_points <- as_tibble(ngi_nmds$points, rownames = "Sample") %>%
   left_join(sample_metadata, by = "Sample")
 
-write_tsv(nmds_points, here(derived_dir, "nmds_points.tsv"))
+nmds_points %>%
+  write_tsv(here(derived_dir, "nmds_points.tsv"))
 
 plot_nmds <- nmds_points %>%
   filter(SizeFrac != "< 0.37") %>%
@@ -486,7 +497,8 @@ heatmap_df <- asv_table_clean %>%
     seq = factor(seq)
   )
 
-write_tsv(heatmap_df, here(derived_dir, "heatmap_top_sequences.tsv"))
+heatmap_df %>%
+  write_tsv(here(derived_dir, "heatmap_top_sequences.tsv"))
 
 plot_heatmap <- heatmap_df %>%
   ggplot(aes(Sample, seq, fill = log10(reads + 1))) +
@@ -535,7 +547,8 @@ biotrack_combined <- bind_rows(
     Date = floor_date(Date_Time, unit = "day")
   )
 
-write_tsv(biotrack_combined, here(derived_dir, "biotrack_combined.tsv"))
+biotrack_combined %>%
+  write_tsv(here(derived_dir, "biotrack_combined.tsv"))
 ```
 
 ```{r biotrack-day-night}
@@ -625,8 +638,10 @@ matched_dna_biotrack <- ngi_biotrack %>%
   ) %>%
   filter(match)
 
-write_tsv(matched_dna_biotrack, here("Data", "Matched_DNA_Biotrack.txt"))
-write_tsv(matched_dna_biotrack, here(derived_dir, "matched_dna_biotrack.tsv"))
+matched_dna_biotrack %>%
+  write_tsv(here("Data", "Matched_DNA_Biotrack.txt"))
+matched_dna_biotrack %>%
+  write_tsv(here(derived_dir, "matched_dna_biotrack.tsv"))
 
 matched_dna_biotrack
 ```
@@ -677,8 +692,10 @@ precip_htm <- precip_raw %>%
   slice(-1) %>%
   mutate(across(-c(date, time), as.numeric))
 
-write_tsv(weather_30m, here(derived_dir, "weather_30m_clean.tsv"))
-write_tsv(precip_htm, here(derived_dir, "precipitation_clean.tsv"))
+weather_30m %>%
+  write_tsv(here(derived_dir, "weather_30m_clean.tsv"))
+precip_htm %>%
+  write_tsv(here(derived_dir, "precipitation_clean.tsv"))
 ```
 
 ```{r weather-wind-rose}
@@ -691,7 +708,8 @@ wind_rose_df <- weather_30m %>%
   ) %>%
   count(Month, WS, WD, name = "freq")
 
-write_tsv(wind_rose_df, here(derived_dir, "wind_rose_counts.tsv"))
+wind_rose_df %>%
+  write_tsv(here(derived_dir, "wind_rose_counts.tsv"))
 
 plot_wind_rose <- wind_rose_df %>%
   ggplot(aes(WD, freq, fill = WS)) +
@@ -725,7 +743,8 @@ deposition_over_time <- deposition_raw %>%
     wind_distance_km = sec * 5 / 1000
   )
 
-write_tsv(deposition_over_time, here(derived_dir, "deposition_over_time.tsv"))
+deposition_over_time %>%
+  write_tsv(here(derived_dir, "deposition_over_time.tsv"))
 
 plot_deposition_time <- deposition_over_time %>%
   ggplot(aes(hours, distance_m, colour = factor(size), group = size)) +
