@@ -106,7 +106,7 @@ sample_metadata <- sample_metadata_raw %>%
       TRUE ~ Blank
     ),
     SizeFrac = as.character(SizeFrac),
-    SizeFrac = recode(
+    SizeFrac = dplyr::recode(
       SizeFrac,
       "1" = "8.83",
       "2" = "4.89",
@@ -530,7 +530,7 @@ biotrack_combined <- bind_rows(
   arrange(Date_Time) %>%
   filter(!Size_frac %in% c("Ch1", "Ch2")) %>%
   mutate(
-    Size_frac = recode(Size_frac, "Ch3" = "1-3um", "Ch4" = "3-5um", "Ch5" = "5-10um", "Ch6" = "10-14um"),
+    Size_frac = dplyr::recode(Size_frac, "Ch3" = "1-3um", "Ch4" = "3-5um", "Ch5" = "5-10um", "Ch6" = "10-14um"),
     bio_per_l = bio / Vol_L,
     Date = floor_date(Date_Time, unit = "day")
   )
