@@ -530,7 +530,7 @@ plot_phylum <- ngi_phylum_relative %>%
   geom_col() +
   geom_text(
     data = phylum_label_df,
-    aes(y = y, label = total_otu),
+    aes(x= SizeFrac, y = y, label = total_otu),
     colour = "white",
     inherit.aes = FALSE
   ) +
@@ -552,7 +552,8 @@ ggsave(here(fig_dir, "figure_relative_phylum_abundance.pdf"), plot = plot_phylum
 ## 7) Rarefaction and coverage-based richness estimates
 
 - Generate rarefaction curves for major phyla.
-- Compute coverage-standardized richness with iNEXT.
+- Precompute NGI phylum-specific matrices once and reuse them across analyses.
+- Compute coverage-standardized richness with `estimateD` (iNEXT package) for faster runtime.
 - Use standardized richness values for between-season and between-size comparisons.
 
 ```{r rarefaction}
@@ -563,19 +564,41 @@ asv_matrix_clean <- asv_table_clean %>%
   as.matrix()
 
 asv_matrix_clean <- asv_matrix_clean[rowSums(asv_matrix_clean) > 0, , drop = FALSE]
+ngi_samples <- sample_metadata %>%
+  filter(Type == "NGI") %>%
+  pull(Sample) %>%
+  intersect(rownames(asv_matrix_clean))
+
+asv_matrix_ngi <- asv_matrix_clean[ngi_samples, , drop = FALSE]
+
+phylum_matrix_tbl <- tibble(phylum = main_phyla) %>%
+  mutate(
+    seq_ids = map(phylum, ~ taxonomy_table_clean %>%
+      filter(phylum == .x) %>%
+      pull(seq)),
+    matrix = map(seq_ids, ~ {
+      phylum_matrix <- asv_matrix_ngi[, intersect(.x, colnames(asv_matrix_ngi)), drop = FALSE]
+      phylum_matrix <- phylum_matrix[rowSums(phylum_matrix) > 0, , drop = FALSE]
+      phylum_matrix
+    })
+  ) %>%
+  filter(map_int(matrix, nrow) > 0, map_int(matrix, ncol) > 0)
+
+phylum_matrix_sizes <- phylum_matrix_tbl %>%
+  transmute(
+    phylum,
+    n_samples = map_int(matrix, nrow),
+    n_sequences = map_int(matrix, ncol)
+  )
+
+phylum_matrix_sizes %>%
+  write_tsv(here(derived_dir, "phylum_matrix_sizes.tsv"))
 
 rarefaction_list <- list()
 
-for (phylum_name in main_phyla) {
-  seq_ids <- taxonomy_table_clean %>%
-    filter(phylum == phylum_name) %>%
-    pull(seq)
-
-  phylum_matrix <- asv_matrix_clean[, intersect(seq_ids, colnames(asv_matrix_clean)), drop = FALSE]
-  phylum_matrix <- phylum_matrix[rowSums(phylum_matrix) > 0, , drop = FALSE]
-
-  if (ncol(phylum_matrix) == 0 || nrow(phylum_matrix) == 0) next
-
+for (i in seq_len(nrow(phylum_matrix_tbl))) {
+  phylum_name <- phylum_matrix_tbl$phylum[[i]]
+  phylum_matrix <- phylum_matrix_tbl$matrix[[i]]
   rare_df <- rarecurve(phylum_matrix, step = 200, tidy = TRUE)
   rare_df$Phylum <- phylum_name
   rarefaction_list[[phylum_name]] <- rare_df
@@ -604,36 +627,38 @@ ggsave(here(fig_dir, "figure_rarefaction_curves.png"), plot = plot_rarefaction, 
 ```
 
 ```{r diversity-estimates, cache=TRUE}
-diversity_estimate_list <- list()
+coverage_target <- 0.99
 
-for (phylum_name in main_phyla) {
-  seq_ids <- taxonomy_table_clean %>%
-    filter(phylum == phylum_name) %>%
-    pull(seq)
-
-  phylum_matrix <- asv_matrix_clean[, intersect(seq_ids, colnames(asv_matrix_clean)), drop = FALSE]
-  phylum_matrix <- phylum_matrix[rowSums(phylum_matrix) > 0, , drop = FALSE]
-
-  if (ncol(phylum_matrix) == 0 || nrow(phylum_matrix) == 0) next
-
-  inext_out <- iNEXT::iNEXT(t(phylum_matrix), datatype = "abundance", q = 0, nboot = 10)
-
-  inext_df <- inext_out$iNextEst$coverage_based %>%
-    rename(Sample = Assemblage) %>%
-    group_by(Sample) %>%
-    filter(SC == 1) %>%
-    filter(m == max(m)) %>%
-    slice(1) %>%
-    ungroup() %>%
-    mutate(phylum = phylum_name)
-
-  diversity_estimate_list[[phylum_name]] <- inext_df
-}
-
-diversity_estimates <- bind_rows(diversity_estimate_list)
+diversity_estimates <- phylum_matrix_tbl %>%
+  mutate(
+    estimate = map(
+      matrix,
+      ~ iNEXT::estimateD(
+        t(.x),
+        datatype = "abundance",
+        base = "coverage",
+        level = coverage_target,
+        q = 0,
+        nboot = 0
+      )
+    )
+  ) %>%
+  select(phylum, estimate) %>%
+  unnest(estimate) %>%
+  rename(Sample = Assemblage)
 
 diversity_estimates %>%
   write_tsv(here(derived_dir, "diversity_estimates_iNEXT.tsv"))
+
+diversity_estimates %>%
+  group_by(phylum) %>%
+  summarise(
+    n_samples = n(),
+    median_coverage = median(SC),
+    min_coverage = min(SC),
+    max_coverage = max(SC),
+    .groups = "drop"
+  )
 ```
 
 ## 8) Richness trends by size class, season, and DNA concentration
