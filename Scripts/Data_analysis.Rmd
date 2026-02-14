@@ -3,13 +3,21 @@ title: "Airborne eDNA Size-Fraction Analysis"
 output: html_notebook
 ---
 
-This notebook reports the full size-fraction airborne eDNA analysis used for the manuscript. It starts from processed sequencing and metadata tables and generates the quantitative summaries, statistical models, and figures used to interpret biological patterns across aerosol size classes and seasons.
-
-The workflow follows the analytical logic of the study: establish sequencing quality and control behavior, evaluate and remove contaminants, quantify richness and composition patterns across size fractions, integrate molecular data with optical bioaerosol observations, and provide meteorological and deposition context.
+- Purpose: report the full size-fraction airborne eDNA analysis used for the manuscript.
+- Input level: processed sequencing and metadata tables already prepared upstream.
+- Output level: manuscript-ready QC summaries, intermediate tables, statistical results, and figures.
+- Analytical order:
+  - sequencing depth and controls,
+  - contaminant assessment and filtering,
+  - richness and composition patterns across size fractions and seasons,
+  - integration with Biotrack optical measurements,
+  - weather and deposition context.
 
 ## 1) Analysis setup
 
-This section loads the packages used throughout the manuscript and prepares output folders for tables and figures. All derived outputs are written to disk so the full workflow remains inspectable and reproducible for reviewers.
+- Load analysis packages.
+- Set default plotting theme.
+- Create output directories for figures and derived tables.
 
 ```{r setup, message=FALSE, warning=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
@@ -37,7 +45,10 @@ dir.create(derived_dir, recursive = TRUE, showWarnings = FALSE)
 
 ## 2) Load manuscript input data
 
-The notebook reads the core processed input data tables directly from the repository. These include the ASV abundance matrix, taxonomic assignments and assignment confidence, sample metadata, DNA concentration measurements, Biotrack optical particle measurements, meteorological observations, and deposition-speed input values.
+- Read processed ASV abundance and taxonomy tables.
+- Read sample metadata and DNA concentration measurements.
+- Read Biotrack campaign files.
+- Read meteorological and deposition inputs.
 
 ```{r load-data}
 asv_table_raw <- read_tsv(here("Data", "COI_ASW_glom.txt"), show_col_types = FALSE)
@@ -84,7 +95,10 @@ tibble(
 
 ## 3) Prepare sample metadata for ecological comparisons
 
-Sample metadata are harmonized into an analysis-ready table with parsed start/end times, season assignment, and mapped NGI size-fraction labels in aerodynamic diameter classes. This table provides the primary design structure for downstream comparisons across size fractions and between fall and spring campaigns.
+- Harmonize sample metadata into one analysis table.
+- Parse timestamps and derive season.
+- Map NGI stage labels to aerodynamic diameter classes.
+- Keep only samples present in the ASV table.
 
 ```{r metadata-prep}
 sample_metadata <- sample_metadata_raw %>%
@@ -130,7 +144,10 @@ sample_metadata %>%
 
 ## 4) Read-depth quality assessment and manuscript reporting statistics
 
-This section evaluates library yield across positive samples and negative controls. The goal is to document sequencing depth distributions in a form that can be reported in the Methods/Results text, and to identify potential outliers such as low-read positive samples or high-read controls.
+- Summarize total reads and detected sequence counts per sample.
+- Compare positive samples and negative controls.
+- Flag low-read positive samples and high-read controls using fixed thresholds.
+- Save method-ready summary statistics and flagged sample lists.
 
 ```{r read-summary}
 control_samples <- c("Extr_Bl", "S55", "S64", "S81")
@@ -193,6 +210,9 @@ method_read_stats <- sample_read_summary %>%
   ) %>%
   pivot_longer(cols = everything(), names_to = "metric", values_to = "value")
 
+method_read_stats_wide <- method_read_stats %>%
+  pivot_wider(names_from = metric, values_from = value)
+
 read_depth_stats %>%
   write_tsv(here(derived_dir, "read_depth_summary_by_class.tsv"))
 read_depth_flags %>%
@@ -200,31 +220,18 @@ read_depth_flags %>%
 method_read_stats %>%
   write_tsv(here(derived_dir, "method_read_depth_stats.tsv"))
 
-list(
-  summary_by_class = read_depth_stats,
-  method_reporting_stats = method_read_stats,
-  flagged_samples = read_depth_flags
-)
+read_depth_stats
 ```
 
-```{r read-depth-interpretation}
-method_read_stats_wide <- method_read_stats %>%
-  pivot_wider(names_from = metric, values_from = value)
-
-cat(
-  "Sequencing depth summary:\\n",
-  "- Positive samples:", method_read_stats_wide$n_positive_samples, "\\n",
-  "- Negative controls:", method_read_stats_wide$n_negative_controls, "\\n",
-  "- Mean reads in positive samples:", round(method_read_stats_wide$mean_reads_positive), "\\n",
-  "- Median reads in positive samples:", round(method_read_stats_wide$median_reads_positive), "\\n",
-  "- Mean reads in controls:", round(method_read_stats_wide$mean_reads_controls), "\\n",
-  "- Median reads in controls:", round(method_read_stats_wide$median_reads_controls), "\\n",
-  "- Low-read positive samples (<", low_positive_threshold, "reads):", method_read_stats_wide$n_low_read_positive, "\\n",
-  "- High-read controls (>=", high_control_threshold, "reads):", method_read_stats_wide$n_high_read_controls, "\\n"
-)
-```
-
-The rank plot below visualizes sequencing depth spread within positive and control classes, and includes reference lines marking the thresholds used above for low-read positives and high-read controls.
+- Positive samples: `r method_read_stats_wide$n_positive_samples`
+- Negative controls: `r method_read_stats_wide$n_negative_controls`
+- Mean reads in positive samples: `r round(method_read_stats_wide$mean_reads_positive)`
+- Median reads in positive samples: `r round(method_read_stats_wide$median_reads_positive)`
+- Mean reads in controls: `r round(method_read_stats_wide$mean_reads_controls)`
+- Median reads in controls: `r round(method_read_stats_wide$median_reads_controls)`
+- Low-read positive samples (`r low_positive_threshold` reads cutoff): `r method_read_stats_wide$n_low_read_positive`
+- High-read controls (`r high_control_threshold` reads cutoff): `r method_read_stats_wide$n_high_read_controls`
+- Plot below: read-depth rank distribution by sample class.
 
 ```{r read-depth-rank-plot}
 plot_reads_rank <- sample_read_summary %>%
@@ -249,7 +256,8 @@ ggsave(
 )
 ```
 
-DNA concentration and sequencing depth are plotted together for positive samples to show how extraction yield and sequencing yield co-vary across seasons and sample types.
+- Plot below: relationship between DNA concentration and sequencing depth for positive samples.
+- Objective: assess whether sample-yield variation could influence downstream richness comparisons.
 
 ```{r dna-vs-reads}
 plot_dna_reads <- sample_read_summary %>%
@@ -275,7 +283,15 @@ ggsave(
 
 ## 5) Contaminant assessment and removal
 
-This section applies three contaminant checks: (i) sequences observed in the extraction blank, (ii) sequences observed in process blanks, and (iii) sequences taxonomically assigned to human. The union of these candidates is removed from all samples. Control samples are summarized before and after filtering to document whether high-read controls are dominated by candidate contaminants and how much residual signal remains.
+- Candidate contaminants include:
+  - sequences detected in extraction blank,
+  - sequences detected in process blanks,
+  - sequences assigned to human.
+- The union is removed from all samples.
+- Outputs include:
+  - contaminant catalog with taxonomy,
+  - per-sample occurrence and read totals for each contaminant sequence,
+  - control accounting before and after filtering.
 
 ```{r contaminant-checks}
 extraction_blank_sequences <- asv_table_raw %>%
@@ -303,6 +319,11 @@ contaminant_catalog <- bind_rows(
 ) %>%
   distinct()
 
+contaminant_catalog_taxonomy <- contaminant_catalog %>%
+  group_by(seq) %>%
+  summarise(contaminant_source = str_c(sort(unique(source)), collapse = "; "), .groups = "drop") %>%
+  left_join(taxonomy_table_raw, by = "seq")
+
 control_contaminant_accounting <- asv_table_raw %>%
   filter(Sample %in% control_samples) %>%
   pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>%
@@ -311,7 +332,8 @@ control_contaminant_accounting <- asv_table_raw %>%
     contaminant_flag = case_when(
       seq %in% sequences_to_remove ~ "candidate_contaminant",
       TRUE ~ "not_flagged"
-    )
+    ),
+    contaminant_flag = factor(contaminant_flag, levels = c("candidate_contaminant", "not_flagged"))
   ) %>%
   group_by(Sample, contaminant_flag) %>%
   summarise(
@@ -319,20 +341,48 @@ control_contaminant_accounting <- asv_table_raw %>%
     n_seq = n(),
     .groups = "drop"
   ) %>%
-  pivot_wider(names_from = contaminant_flag, values_from = c(reads, n_seq), values_fill = 0) %>%
+  pivot_wider(
+    names_from = contaminant_flag,
+    values_from = c(reads, n_seq),
+    values_fill = 0,
+    names_expand = TRUE
+  ) %>%
   mutate(
-    prop_reads_candidate_contaminant = reads_candidate_contaminant / (reads_candidate_contaminant + reads_not_flagged)
+    prop_reads_candidate_contaminant = reads_candidate_contaminant / pmax(reads_candidate_contaminant + reads_not_flagged, 1)
   )
 
-contaminant_catalog %>%
+contaminant_details <- asv_table_raw %>%
+  pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>%
+  filter(seq %in% sequences_to_remove, reads > 0) %>%
+  left_join(contaminant_catalog_taxonomy, by = "seq") %>%
+  group_by(seq, contaminant_source, kingdom, phylum, class, order, family, genus, species) %>%
+  summarise(
+    n_samples_detected = n_distinct(Sample),
+    n_control_samples_detected = n_distinct(Sample[Sample %in% control_samples]),
+    total_reads_all_samples = sum(reads),
+    total_reads_controls = sum(reads[Sample %in% control_samples]),
+    sample_list = str_c(sort(unique(Sample)), collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_reads_all_samples))
+
+contaminant_catalog_taxonomy %>%
   write_tsv(here(derived_dir, "contaminant_catalog.tsv"))
 control_contaminant_accounting %>%
   write_tsv(here(derived_dir, "control_contaminant_accounting_before_filter.tsv"))
+contaminant_details %>%
+  write_tsv(here(derived_dir, "contaminant_sequence_details.tsv"))
 
-list(
-  contaminant_sequence_sources = contaminant_catalog %>% count(source),
-  control_accounting_before_filter = control_contaminant_accounting
-)
+contaminant_catalog_taxonomy %>%
+  count(contaminant_source, name = "n_sequences")
+```
+
+```{r contaminant-details-table}
+contaminant_details
+```
+
+```{r control-contaminant-accounting}
+control_contaminant_accounting
 ```
 
 ```{r remove-contaminants}
@@ -368,10 +418,9 @@ contaminant_removal_summary <- tibble(
 )
 
 contaminant_removal_summary
-control_after_filter
 ```
 
-```{r contaminant-interpretation}
+```{r control-summary-stats}
 control_after_summary <- control_after_filter %>%
   summarise(
     n_controls = n(),
@@ -387,25 +436,45 @@ control_before_summary <- control_contaminant_accounting %>%
     max_prop_candidate_contaminant = max(prop_reads_candidate_contaminant)
   )
 
-cat(
-  "Contaminant filtering summary in controls:\\n",
-  "- Mean proportion of control reads flagged as candidate contaminants before filtering:",
-  round(control_before_summary$mean_prop_candidate_contaminant, 3), "\\n",
-  "- Range across controls:",
-  paste0(round(control_before_summary$min_prop_candidate_contaminant, 3), " to ",
-         round(control_before_summary$max_prop_candidate_contaminant, 3)), "\\n",
-  "- Controls with residual reads after filtering:",
-  control_after_summary$n_controls_with_residual_reads, "of", control_after_summary$n_controls, "\\n",
-  "- Median residual reads in controls after filtering:",
-  round(control_after_summary$median_residual_reads), "\\n",
-  "- Maximum residual reads in controls after filtering:",
-  round(control_after_summary$max_residual_reads), "\\n"
+tibble(
+  metric = c(
+    "mean_prop_candidate_contaminant_before_filter",
+    "min_prop_candidate_contaminant_before_filter",
+    "max_prop_candidate_contaminant_before_filter",
+    "controls_with_residual_reads_after_filter",
+    "total_controls",
+    "median_residual_reads_after_filter",
+    "max_residual_reads_after_filter"
+  ),
+  value = c(
+    control_before_summary$mean_prop_candidate_contaminant,
+    control_before_summary$min_prop_candidate_contaminant,
+    control_before_summary$max_prop_candidate_contaminant,
+    control_after_summary$n_controls_with_residual_reads,
+    control_after_summary$n_controls,
+    control_after_summary$median_residual_reads,
+    control_after_summary$max_residual_reads
+  )
 )
 ```
 
+```{r control-after-filter}
+control_after_filter
+```
+
+- Mean proportion of control reads flagged as candidate contaminants before filtering:
+  `r round(control_before_summary$mean_prop_candidate_contaminant, 3)`
+- Range across controls: `r round(control_before_summary$min_prop_candidate_contaminant, 3)` to `r round(control_before_summary$max_prop_candidate_contaminant, 3)`
+- Controls with residual reads after filtering:
+  `r control_after_summary$n_controls_with_residual_reads` of `r control_after_summary$n_controls`
+- Median residual reads in controls after filtering: `r round(control_after_summary$median_residual_reads)`
+- Maximum residual reads in controls after filtering: `r round(control_after_summary$max_residual_reads)`
+
 ## 6) Taxonomic composition across NGI size fractions
 
-Taxonomic composition is summarized across ranks for NGI samples and used to produce phylum-level composition figures for major airborne groups. The phylum plot focuses on Ascomycota, Basidiomycota, and Arthropoda because these groups represent dominant biological signals for manuscript interpretation.
+- Summarize NGI taxonomic composition across ranks.
+- Focus phylum-level figure on Ascomycota, Basidiomycota, and Arthropoda.
+- Report relative OTU composition by size fraction and season.
 
 ```{r taxa-distribution}
 ngi_taxa_distribution <- asv_table_clean %>%
@@ -482,7 +551,9 @@ ggsave(here(fig_dir, "figure_relative_phylum_abundance.pdf"), plot = plot_phylum
 
 ## 7) Rarefaction and coverage-based richness estimates
 
-Rarefaction curves are used to visualize richness accumulation with sequencing depth for major phyla. Coverage-based iNEXT estimates are then used for standardized richness comparisons across seasons and size fractions, reducing bias from uneven read counts.
+- Generate rarefaction curves for major phyla.
+- Compute coverage-standardized richness with iNEXT.
+- Use standardized richness values for between-season and between-size comparisons.
 
 ```{r rarefaction}
 main_phyla <- c("Arthropoda", "Ascomycota", "Basidiomycota", "Chordata")
@@ -567,9 +638,11 @@ diversity_estimates %>%
 
 ## 8) Richness trends by size class, season, and DNA concentration
 
-Coverage-standardized richness is analyzed across size fractions and seasons for the target fungal and arthropod phyla. A linear model then quantifies the relative contributions of season, phylum, size fraction, and DNA concentration.
+- Plot coverage-standardized richness across size fractions and seasons.
+- Evaluate DNA concentration versus richness.
+- Fit a linear model to quantify contributions of season, phylum, size fraction, and DNA concentration.
 
-```{r diversity-plots}
+```{r richness-by-size-plot}
 diversity_plot_data <- diversity_estimates %>%
   filter(phylum != "Chordata") %>%
   left_join(sample_metadata, by = "Sample") %>%
@@ -588,7 +661,9 @@ plot_richness_size <- diversity_plot_data %>%
 plot_richness_size
 
 ggsave(here(fig_dir, "figure_richness_by_size_fraction.png"), plot = plot_richness_size, width = 6, height = 7, dpi = 300)
+```
 
+```{r dna-vs-richness-plot}
 plot_dna_richness <- diversity_plot_data %>%
   left_join(dna_concentration, by = "Sample") %>%
   ggplot(aes(DNA_C, qD, colour = season)) +
@@ -622,7 +697,9 @@ diversity_model_anova
 
 ## 9) Community ordination and dominant sequence patterns
 
-Community structure is visualized with Bray-Curtis NMDS using NGI samples. A sequence heatmap of dominant ASVs per sample complements the ordination by showing broad abundance-pattern contrasts across size fractions and seasons.
+- Visualize compositional structure with Bray-Curtis NMDS.
+- Visualize dominant ASV patterns with a heatmap.
+- Compare size-fraction and seasonal structure in community composition.
 
 ```{r nmds}
 asv_ngi_matrix <- asv_table_clean %>%
@@ -692,7 +769,9 @@ ggsave(here(fig_dir, "figure_heatmap_top_sequences.png"), plot = plot_heatmap, w
 
 ## 10) Process Biotrack optical measurements
 
-Biotrack channel data from the four campaigns are merged into a common table and converted to concentrations per liter. The analysis focuses on channels corresponding to approximately 1-14 um particles to align optical size classes with the sequencing size-fraction framework.
+- Merge Biotrack campaign files into one dataset.
+- Convert counts to concentrations per liter.
+- Keep optical size classes aligned with the sequencing size-fraction framework.
 
 ```{r biotrack-prepare}
 biotrack_combined <- bind_rows(
@@ -783,7 +862,9 @@ ggsave(here(fig_dir, "figure_biotrack_time_series.png"), plot = plot_biotrack_ti
 
 ## 11) Link NGI filter classes with Biotrack classes
 
-To relate molecular richness and concentration patterns to optical measurements, NGI sample windows are matched to Biotrack observations over the same sampling intervals. Biotrack channels are then grouped to align with NGI aerodynamic size ranges.
+- Match NGI sampling windows to Biotrack timestamps.
+- Aggregate Biotrack channels to NGI-comparable size classes.
+- Relate optical counts to DNA concentration and richness.
 
 ```{r match-ngi-biotrack}
 ngi_biotrack <- sample_metadata %>%
@@ -820,7 +901,7 @@ matched_dna_biotrack %>%
 matched_dna_biotrack
 ```
 
-```{r biotrack-dna-richness-plots}
+```{r biotrack-vs-dna-plot}
 plot_dna_vs_biotrack <- matched_dna_biotrack %>%
   left_join(dna_concentration, by = "Sample") %>%
   left_join(sample_metadata, by = "Sample") %>%
@@ -833,7 +914,9 @@ plot_dna_vs_biotrack <- matched_dna_biotrack %>%
 plot_dna_vs_biotrack
 
 ggsave(here(fig_dir, "figure_biotrack_vs_dna.png"), plot = plot_dna_vs_biotrack, width = 6, height = 4, dpi = 300)
+```
 
+```{r biotrack-vs-richness-plot}
 plot_richness_vs_biotrack <- matched_dna_biotrack %>%
   left_join(diversity_estimates, by = "Sample") %>%
   filter(!is.na(phylum), phylum != "Chordata") %>%
@@ -853,7 +936,9 @@ ggsave(here(fig_dir, "figure_biotrack_vs_richness.png"), plot = plot_richness_vs
 
 ## 12) Weather context and wind-direction structure
 
-Meteorological data are cleaned to provide environmental context for the sampling period. A wind-direction summary is included to describe dominant airflow sectors by month, which supports interpretation of temporal shifts in observed airborne biological communities.
+- Clean meteorological inputs for the study period.
+- Summarize wind speed and direction by month.
+- Provide airflow context for observed biological patterns.
 
 ```{r weather-clean}
 weather_30m <- weather_30m_raw %>%
@@ -899,9 +984,11 @@ ggsave(here(fig_dir, "figure_wind_rose_by_month.png"), plot = plot_wind_rose, wi
 
 ## 13) Size-dependent dry deposition trajectories
 
-Dry deposition trajectories are calculated over 72 hours to illustrate how quickly different particle-size classes settle vertically and how far they can travel horizontally under a constant reference wind speed. These trajectories provide a physical interpretation layer for observed size-fraction biological patterns.
+- Compute dry deposition trajectories over 72 hours by size class.
+- Quantify vertical settling distance and potential horizontal travel distance.
+- Provide physical context for size-fraction biological observations.
 
-```{r deposition}
+```{r deposition-prepare}
 colnames(deposition_raw) <- c("size", "speed", "distance")
 
 deposition_over_time <- deposition_raw %>%
@@ -919,7 +1006,9 @@ deposition_over_time <- deposition_raw %>%
 
 deposition_over_time %>%
   write_tsv(here(derived_dir, "deposition_over_time.tsv"))
+```
 
+```{r deposition-time-plot}
 plot_deposition_time <- deposition_over_time %>%
   ggplot(aes(hours, distance_m, colour = factor(size), group = size)) +
   geom_line() +
@@ -932,7 +1021,9 @@ plot_deposition_time <- deposition_over_time %>%
 plot_deposition_time
 
 ggsave(here(fig_dir, "figure_dry_deposition_over_time.png"), plot = plot_deposition_time, width = 7, height = 4, dpi = 300)
+```
 
+```{r deposition-wind-plot}
 plot_deposition_wind <- deposition_over_time %>%
   ggplot(aes(wind_distance_km, distance_m, colour = factor(size), group = size)) +
   geom_line() +
@@ -949,7 +1040,7 @@ ggsave(here(fig_dir, "figure_dry_deposition_with_wind.png"), plot = plot_deposit
 
 ## 14) Session information
 
-Session information is saved at the end so software versions are documented with the analytical output.
+- Save session information for reproducibility and version tracking.
 
 ```{r session-info}
 sessionInfo()
