@@ -1,0 +1,9 @@
+.DS_Store
+.Rhistory
+.Rproj.user/
+Documents/~$*
+Scripts/*.nb.html
+
+# Large raw/reference assets not required for manuscript commit history
+Data/Sequencing_Data/
+Data/MIDORI2_UNIQ_NUC_SP_GB259_CO1_SINTAX.fasta
