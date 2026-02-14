@@ -1,0 +1,383 @@
+---
+title: "demultiplexing and trimmming - Plate2"
+author: "Fabian Roger"
+date: "11/4/2021"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(readr)
+library(jsonlite)
+library(Biostrings)
+library(here)
+```
+
+# demultiplexing by index
+
+I use the [pheniqs](https://biosails.github.io/pheniqs/) software for demultiplexing. 
+
+> Galanti L, Shasha D, Gunsalus KC. 2021 Pheniqs 2.0: accurate, high-performance Bayesian decoding and confidence estimation for combinatorial barcode indexing. BMC Bioinformatics 22, 359. (doi:10.1186/s12859-021-04267-5)
+
+It uses Phred adjusted maximum likelihood decoding
+> A maximum likelihood decoder that directly estimates the decoding error probability from the base calling error probabilities provided by the sequencing platform. Abbreviated PAMLD.
+
+We need to provide it with a configuration file that links the samples to the dual unique indices. 
+
+We split the sample onto two sequencing runs, Plate 1 and Plate 2. The indexing-sheet for plate 1 is the following:
+
+```{r}
+Plate2 <- read_tsv(here("Data", "Plate_2_index.txt")) %>% 
+  filter(!is.na(Sample))
+```
+
+## indices
+
+the barcodes corresponding to the indices are in the sheet called order_1.csv. The sheet contains the full sequence of the indexing primers so we have to extract the indices from the full sequence.
+
+```{r}
+Indexlist <- 
+  read_csv(here("Data", "order_1.csv")) %>% 
+  select(Sequence, "Sequence Name", "Well Position") %>% 
+  filter(grepl("^P5_\\d\\d|^P7_\\d\\d", `Sequence Name`)) %>% 
+  mutate(Sequence = gsub(" ", "", Sequence)) %>% 
+  mutate(index = gsub("AATGATACGGCGACCACCGAGATCTACAC(.+)ACACTCTTTCCCTACACGACGCT", "\\1", Sequence))%>%
+  mutate(index = gsub("CAAGCAGAAGACGGCATACGAGAT(.+)GTGACTGGAGTTCAGACGTGTGCT", "\\1", index))
+  
+P7 <- 
+Indexlist%>% 
+  filter(`Sequence Name` %in% paste("P7_", formatC(1:96, width = 2, flag = 0), sep = "")) %>% 
+  arrange(`Sequence Name`)
+  
+P5 <- 
+Indexlist%>% 
+  filter(`Sequence Name` %in% paste("P5_", formatC(1:96, width = 2, flag = 0), sep = "")) %>% 
+  arrange(`Sequence Name`)
+
+index_combo <- 
+  tibble(indexpair = paste(P7$`Sequence Name`, P5$`Sequence Name`, sep ="_"), 
+         P7 = P7$index,
+         P5 = P5$index,
+         revcomb = as.character(reverseComplement(DNAStringSet(P5)))) %>% 
+  filter(indexpair %in% Plate2$indexpair)
+  
+```
+
+join indexing sheet with index combinations
+```{r}
+
+Plate2 <- 
+  Plate2 %>% 
+  left_join(index_combo) %>% 
+  group_by(Sample) %>% 
+  mutate(Sample = case_when(n() > 1 ~ paste(Sample, 1:n(), sep = ""),
+                            TRUE ~ Sample))
+
+```
+
+## configuration file 
+
+phenix takes a json formatted configuration file. An example is given [here](https://github.com/biosails/pheniqs/blob/master/example/illumina_vignette/H7LT2DSXX_l01_sample_static.json) which we take as basis for modification 
+
+```{r}
+phenix_config <- read_json(here("Data", "Sequencing_Data", "211026_M06272_0033_000000000-JPY84", "phenix_config_file.json"))
+```
+
+## base configurations
+
+Here we give the
++ input directory (where the files are)
++ output directory (where the files should be written to)
++ the 4 filenames (reads (R) and indices (I) for forward and reverse)
++ and the filename of the sample report
+
+note that $output will be ignored if we write the reads to demultiplexed fastq files
+```{r}
+phenix_config$PM <- "unkown"
+
+phenix_config$`base input url` <- here("Data", "Sequencing_Data", "211026_M06272_0033_000000000-JPY84")
+
+phenix_config$`base output url` <- here("Data", "Sequencing_Data", "211026_M06272_0033_000000000-JPY84", "demultiplexed")
+
+dir.create(phenix_config$`base output url`)
+
+phenix_config$`flowcell id` <- "unkown"
+
+#forward reads
+phenix_config$input[[1]] <- "Undetermined_S0_L001_R1_001.fastq.gz"
+
+#forward index
+phenix_config$input[[2]] <- "Undetermined_S0_L001_I1_001.fastq.gz"
+
+#reverse index
+phenix_config$input[[3]] <- "Undetermined_S0_L001_I2_001.fastq.gz"
+
+#reverse reads
+phenix_config$input[[4]] <- "Undetermined_S0_L001_R2_001.fastq.gz"
+
+#output
+phenix_config$output[[1]] <- "Undetermined_S0_L001.bam"
+
+#report
+phenix_config$`report url` <- "sample_report.json"
+
+```
+
+
+#barcodes
+
+Here we format the core of the configuration file, associating each sample with the unique barcode configuration
+
+Plate1 is a dataframe containing the sample names, the P5 barcode, the P7 barcode and the reverseComplement of the barcode (in my case)
+
+We used the P5 universal tail on the forward primer and the P7 universal tail on the reverse primer. The index on the first read (P7) is in reverse complement.
+
+```{r}
+my_config <- 
+phenix_config$sample$codec[1:nrow(Plate2)]
+
+names(my_config) <- paste("@", Plate2$Sample, sep ="")
+
+for(i in names(my_config)){
+  
+  sample <- gsub("@", "", i)
+  my_config[[i]]$LB <- sample
+  my_config[[i]]$barcode[[1]] <- Plate2[Plate2$Sample == sample,]$revcomb
+  my_config[[i]]$barcode[[2]] <- Plate2[Plate2$Sample == sample,]$P5
+  
+  my_config[[i]]$output[[1]] <- paste(sample, "_R1.fastq.gz", sep ="")
+  my_config[[i]]$output[[2]] <- paste(sample, "_R2.fastq.gz", sep ="")
+  
+}
+
+phenix_config$sample$codec <- my_config
+
+phenix_config$sample$undetermined$output[[1]] <- "unclear_barcode_R1.fastq.gz"
+phenix_config$sample$undetermined$output[[2]] <- "unclear_barcode_R2.fastq.gz"
+```
+
+## Save configuration file
+```{r}
+path_to_file <- here("Data", "Sequencing_Data", "211026_M06272_0033_000000000-JPY84", "phenix_config_plate2.json")
+
+write_json(phenix_config, path_to_file, pretty = T, auto_unbox = TRUE)
+```
+
+## run pheniqs
+```{r}
+system(paste("/Users/fabian/pheniqs_head_static/bin/static-HEAD/install/bin/pheniqs mux --config ",path_to_file, sep = ""))
+```
+
+## check report
+```{r}
+report <- read_json(here("Data", "Sequencing_Data", "211026_M06272_0033_000000000-JPY84", "demultiplexed", "sample_report.json"))
+```
+
+total number of reads
+```{r}
+report$outgoing$count
+```
+
+
+fraction of reads with valid indices
+```{r}
+report$outgoing$`pf fraction`
+```
+
+
+```{r}
+report$sample$classified %>% 
+  lapply(., as.data.frame) %>% 
+  bind_rows() %>% 
+  select(LB, BC, count) %>% 
+  mutate(prct = signif(count/sum(count)*100, 2))
+```
+
+
+# demultiplexing by primer
+
+I pooled two different primer pairs: COI (Leray Primers) and 16S (Vet16S primers)
+
+I will use cutadapt to sort the reads by primer into separate files
+
+
+## primer
+
+###COI
+
+We used the Leray primer pair to sequence COI
+
+> 1.Leray M, Yang JY, Meyer CP, Mills SC, Agudelo N, Ranwez V, Boehm JT, Machida RJ. 2013 A new versatile primer set targeting a short fragment of the mitochondrial COI region for metabarcoding metazoan diversity: application for characterizing coral reef fish gut contents. Frontiers in Zoology 10, 34. (doi:10.1186/1742-9994-10-34)
+
+
+
+We have a mix of three forward primer that are shifted by a few basepairs. the shift is between the Illumina adaptor and consist on an insert of 8,7 and 4 bp respectively. This is to increase the diversity on the flow cell. 
+
+I used forward primers with a P5 Illumina adaptor and reverse primers with a p7 Illumina adaptor.
+
+Forward Primer:
+
+```{r}
+P5_mICOIintF_C <- "ACACTCTTTCCCTACACGACGCTCTTCCGATCTTGTAAGTTGGWACWGGWTGAACWGTWTAYCCYCC"
+P5_mICOIintF_B <- "ACACTCTTTCCCTACACGACGCTCTTCCGATCTACCTACCGGWACWGGWTGAACWGTWTAYCCYCC"
+P5_mICOIintF_A <- "ACACTCTTTCCCTACACGACGCTCTTCCGATCTCGGTGGWACWGGWTGAACWGTWTAYCCYCC"
+
+AlignSeqs(DNAStringSet(c(P5_mICOIintF_C,P5_mICOIintF_B,P5_mICOIintF_A)), verbose = F)
+```
+
+```{r}
+Fwrd_COI <- "GGWTGAACWGTWTAYCCYCC" 
+```
+
+Reverse primer:
+
+```{r}
+P7_HCO2198_C <- "GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCTAGTCGTTGCATAAACTTCAGGGTGACCAAAAAATCA"
+P7_HCO2198_B <- "GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCTAAGATCCTAAACTTCAGGGTGACCAAAAAATCA"
+P7_HCO2198_A <- "GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCTGCACATAAACTTCAGGGTGACCAAAAAATCA"
+
+AlignSeqs(DNAStringSet(c(P7_HCO2198_C,P7_HCO2198_B,P7_HCO2198_A)), verbose = F)
+```
+
+
+```{r}
+Rev_COI <- "TAAACTTCAGGGTGACCAAAAAATCA" 
+```
+
+### 16S
+
+For vertebrates I used primers targeting the mitochondrial vertebrate 16S gene
+
+
+1.Evans NT, Olds BP, Renshaw MA, Turner CR, Li Y, Jerde CL, Mahon AR, Pfrender ME, Lamberti GA, Lodge DM. 2016 Quantification of mesocosm fish and amphibian species diversity via environmental DNA metabarcoding. Molecular Ecology Resources 16, 29–41. (doi:https://doi.org/10.1111/1755-0998.12433)
+
+I used forward primers with a P5 Illumina adaptor and reverse primers with a p7 Illumina adaptor.
+
+```{r}
+P5_Ve16S_F <- "ACACTCTTTCCCTACACGACGCTCTTCCGATCTCGAGAAGACCCTATGGAGCTTA"
+P7_Ve16S_R <- "GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCTAATCGTTGAACAAACGAACC"
+```
+
+
+```{r}
+Fwrd_16S <- "CGAGAAGACCCTATGGAGCTTA" 
+
+Rev_16S <- "AATCGTTGAACAAACGAACC" 
+```
+
+## sorting by primer
+
+I use [cutadapt](https://cutadapt.readthedocs.io/en/stable/guide.html) to sort the reads by primer into different files.
+
+setting up variables:
+```{r}
+dm_files <- list.files(here("Data", "Sequencing_Data", "211026_M06272_0033_000000000-JPY84", "demultiplexed"), full.names = F)
+
+dm_files <- dm_files[!grepl("unclear_barcode", dm_files)]
+
+forward_raw <- dm_files[grepl("_R1.fastq.gz", dm_files)]
+reverse_raw <- dm_files[grepl("_R2.fastq.gz", dm_files)]
+
+#create directories for two primer pairs
+path_COI <- here("Data", "Sequencing_Data", "211026_M06272_0033_000000000-JPY84", "primer_COI")
+dir.create(path_COI)
+
+path_16S <- here("Data", "Sequencing_Data", "211026_M06272_0033_000000000-JPY84", "primer_16S") 
+dir.create(path_16S)
+
+#path to sequences
+path_demulti <- here("Data", "Sequencing_Data", "211026_M06272_0033_000000000-JPY84", "demultiplexed")
+
+#minimum length for sequences after trimming (shorter sequences are discarded)
+minlength <- 100
+
+#number of cores to use 
+Cores <- 8
+```
+
+run cutadapt twice. 
+
+1. search for COI primer. If found, write to file
+2. search for 16S primer. If found, write to file
+
+-g specifies that the primer adaptor is at the 5' end of the read.
+
+> 5’ adapters preceed the sequence of interest
+
+```{r}
+for (i in seq_along(forward_raw)) {
+
+#sort COI in separate file
+temp <- 
+system(
+paste("cutadapt -g ", Fwrd_COI,
+      " -G ", Rev_COI,
+      " --pair-filter=both",
+      " --discard-untrimmed",
+      " --minimum-length=", minlength, #minimum length for sequences after trimming
+      " --cores=", Cores, # Number of cores to use
+      " -o ", paste(path_COI, "/", forward_raw[i], sep = ""),
+      " -p ", paste(path_COI, "/", reverse_raw[i], sep = ""),
+      paste(" ", path_demulti, "/", forward_raw[i], sep = ""),
+      paste(" ", path_demulti, "/", reverse_raw[i], sep = ""),
+      sep = ""
+      ),
+
+intern = TRUE
+)
+
+rm(temp)
+
+#sort 16S in separate file
+temp <- 
+system(
+paste("cutadapt -g ", Fwrd_16S,
+      " -G ", Rev_16S,
+      " --discard-untrimmed",
+      " --minimum-length=", minlength, #minimum length for sequences after trimming
+      " --cores=", Cores, # Number of cores to use
+      " -o ", paste(path_16S, "/", forward_raw[i], sep = ""),
+      " -p ", paste(path_16S,"/", reverse_raw[i], sep = ""),
+      paste(" ", path_demulti, "/", forward_raw[i], sep = ""),
+      paste(" ", path_demulti, "/", reverse_raw[i], sep = ""),
+      sep = ""
+      ),
+
+intern = TRUE
+)
+
+rm(temp)
+
+}
+
+
+```
+
+
+## check how many reads were lost
+```{r}
+COI <- list.files(path_COI, full.names = TRUE)
+COI <- COI[grep("R1", COI)]
+
+p_16S <- list.files(path_16S, full.names = TRUE)
+p_16S <- p_16S[grep("R1", p_16S)]
+
+reads_dm <- lapply(forward_raw, function(x) system(paste("echo $(cat ", here("Data", "Sequencing_Data", "211026_M06272_0033_000000000-JPY84", "demultiplexed",x), "|wc -l)/4|bc"), intern = TRUE))
+
+reads_COI <- lapply(COI, function(x) system(paste("echo $(cat ", x, "|wc -l)/4|bc"), intern = TRUE))
+
+reads_16S <- lapply(p_16S, function(x) system(paste("echo $(cat ", x, "|wc -l)/4|bc"), intern = TRUE))
+
+tibble(Sample = gsub("_R1.fastq.gz", "", forward_raw),
+       N_demplex = unlist(reads_dm),
+       N_COI = unlist(reads_COI),
+       N_16S = unlist(reads_16S)) %>%
+  mutate(across(starts_with("N"), as.numeric)) %>% 
+  rowwise() %>% 
+  mutate(COI_prct = N_COI/N_demplex*100,
+         N16S_prct = N_16S/N_demplex*100,
+         tot_prct = sum(N_16S, N_COI)/N_demplex*100) %>% 
+  mutate(across(ends_with("prct"), round, 2))
+
+```
+

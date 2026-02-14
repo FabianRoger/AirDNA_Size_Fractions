@@ -1,0 +1,955 @@
+---
+title: "airborne eDNA - Leray"
+author: "Fabian Roger"
+date: "2/4/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE, cache=TRUE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+
+```{r, message = FALSE}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(here)
+library(ggplot2)
+#library(gridExtra)
+library(ggrepel)
+library(stringr)
+library(dada2)
+library(ShortRead)
+#library(DECIPHER)
+#library(future.apply) # for parallel processing
+#library(furrr)
+library(rgbif)
+#library(ggtree)
+#library(ape)
+library(phyloseq)
+
+#library(decontam)
+library(googlesheets4)
+#library(lulu)
+library(bold)
+
+#helper functions for sequence analyis
+source(here("Scripts", "Seq_analysis_helper.R"))
+```
+
+#dada2
+This script follows the [DADA2 Pipeline Tutorial (1.12)](https://benjjneb.github.io/dada2/tutorial.html) 
+The original article can be found [here](http://rdcu.be/ipGh)
+
+The script was written with DADA2 version 1.18.0
+
+The data are demultiplexed and trimmed (see `demultiplexing_and_trimming_plate1.Rmd`)
+
+load all trimmed and demultiplexed fastq files for COI and make path for filtered files
+
+We split the samples on two plates, sequenced in two different runs. We infer ASV separately (as error profiles are run-specific) but join the ASV tables later. 
+
+# Plate 2
+Plate contained all samples presented in this publication
+
+##set-up
+
+```{r}
+run_name <- "211026_M06272_0033_000000000-JPY84"
+primer <- "Leray"
+
+#path to primer analysis
+path_primer <- here("Data", "Sequencing_Data", run_name, primer)
+
+#path to trimmed reads
+trimmed_path <- here("Data", "Sequencing_Data", run_name, primer, "trimmed")
+
+#path to plots
+plotpath <- here("Data", "Sequencing_Data", run_name, primer, "plots")
+dir.create_ifnot(plotpath)
+```
+
+# primer seq
+
+mICOIintF : GGWACWGGWTGAACWGTWTAYCCYCC
+jgHCO2198 : TAIACYTCIGGRTGICCRAARAAYCA
+
+Here we work with files were the primers have been trimmed off, as in these files contained more than one amplicon. The primer trimming is done in `demultiplexing_and_trimming_plate2.Rmd`
+
+#Filter
+
+filter trimmed reads
+```{r}
+filterpath <- here("Data", "Sequencing_Data", run_name, primer, "filtered")
+dir.create_ifnot(filterpath)
+```
+
+
+```{r, "sort fwrd and rev", cache=TRUE}
+
+fnFs <- sort(list.files(trimmed_path, pattern="_R1.fastq.gz", full.names = TRUE)) # Just the forward read files
+fnRs <- sort(list.files(trimmed_path, pattern="_R2.fastq.gz", full.names = TRUE)) # Just the reverse read files
+
+# Get sample names from forward read filenames
+sample.names <- 
+   sapply(fnFs, function(x) gsub(".+trimmed/(.+)_R1.fastq.gz", "\\1", x), USE.NAMES = FALSE)
+
+```
+
+###quality profiles
+
+Visualize the quality profile of the forward reads
+
+```{r}
+max_read_sample <- "S48" # sample from large size fraction where we expect more true reads
+```
+
+
+```{r, "plot quality of reads", cache=TRUE}
+# plot one foward and one reverse read in the rapport
+plotQualityProfile(fnFs[grepl(max_read_sample,fnFs)])+
+  scale_y_continuous(limits = c(0,40))+
+  scale_x_continuous(breaks = seq(0,300, 20))+
+  geom_hline(yintercept = 30, colour = "grey", linetype = "dashed")+
+  geom_hline(yintercept = 20, colour = "grey", linetype = "dashed")+
+  labs(title = paste(sample.names[1], "foward", sep = " - " ))
+
+plotQualityProfile(fnRs[grepl(max_read_sample,fnFs)])+
+  scale_y_continuous(limits = c(0,40))+
+  scale_x_continuous(breaks = seq(0,300, 20))+
+  geom_hline(yintercept = 30, colour = "grey", linetype = "dashed")+
+  geom_hline(yintercept = 20, colour = "grey", linetype = "dashed")+
+  labs(title = paste(sample.names[1], "reverse", sep = " - "))
+```
+
+The quality of the reads is  high for the length of the expected fragment size (~270 bp) especially up to 200 bps
+
+### merged read length
+To decide on appropriate trimming parameters, we check the distribution of the merged read-lengths.
+
+we don't need the merged reads (DADA2 needs unmerged reads) so we merge them on them fly and just store the length distributions
+
+
+```{r}
+#merge first file with vsearch
+
+  system(
+  paste(
+    "/Applications/vsearch/bin/vsearch --fastq_mergepairs ", fnFs[grepl(max_read_sample,fnFs)], 
+    " --reverse ", fnRs[grepl(max_read_sample,fnRs)], 
+    " --fastaout", here("Data","Sequencing_Data", run_name, primer, "test_merge.fasta"), 
+    "--fastq_allowmergestagger"
+    ), intern = TRUE
+  )
+  
+  #read file
+file_merged <- readDNAStringSet(here("Data", "Sequencing_Data", run_name, primer, "test_merge.fasta"))
+
+
+table(width(file_merged)) %>% 
+  as.data.frame() %>% 
+  mutate(across(one_of("Var1", "Freq"), function(x) as.numeric(as.character(x)))) %>% 
+  arrange(desc(Freq)) %>% 
+  mutate(prct = Freq / sum(Freq)*100) %>% 
+  mutate(rank = 1:n()) %>% 
+  mutate(Label = case_when( rank < 6 ~ paste(Var1, "(",round(prct,1), " %",")", sep = ""),
+                   TRUE ~ NA_character_)) %>% 
+    ggplot(aes(x = Var1, y = Freq))+
+  geom_line(colour = "darkgrey", alpha = 0.5)+
+  geom_text_repel(aes(label = Label))+
+  geom_point(data = ~filter(.x, !is.na(Label)), colour = "red", size = 0.5)+
+  theme_bw()+
+  scale_x_continuous(limits = c(0,500))
+
+  
+```
+almost all reads have the expected fragment length of 313 basepairs
+
+The primers are 26 + 4-8N = max 34 bps
+
+
+```{r}
+frag_len <- 313
+fwrd_len <- 300-34
+rev_len <- 300-34
+fwrd_trim <- 200
+rev_trim <- 200
+
+
+ggplot(data = tibble(x = c(1,frag_len), y = c(1,5)), aes(x = x, y = y))+
+  geom_blank()+
+  geom_segment(x = 0, xend = frag_len, y = 2, yend = 2)+ #fragment
+  geom_segment(x = 0, xend = fwrd_len, y = 3, yend = 3)+ #fwrd
+  geom_segment(x = frag_len-rev_len, xend = frag_len, y = 3.5, yend = 3.5)+ #rev
+  geom_segment(x = fwrd_trim, xend = fwrd_len, y = 3, yend = 3, 
+               colour = "red", size = 2, alpha = 0.2)+ #fwrd trim
+  geom_segment(x = frag_len-rev_trim, xend = frag_len-rev_len,
+               y = 3.5, yend = 3.5, 
+               colour = "red", size = 3, alpha = 0.2)+ #rev trim
+  geom_segment(x = frag_len-rev_trim, xend = fwrd_trim, y = 2, 
+               yend = 2, colour = "green", size= 3, alpha = 0.2)+ #overlap
+  geom_text(x = ((frag_len-rev_trim) + fwrd_trim)/2, y = 2.25, 
+            label = paste(as.character(fwrd_trim+rev_trim-frag_len), "bp"),
+            colour = "blue", size= 5)+
+  theme_void()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_x_continuous(breaks = seq(0,frag_len, 12))
+```
+The qualilty is high up to 200 bps, I keep 200 on each read.
+
+
+The filtering parameters we’ll use are standard (DADA is [robust to low quality sequences](https://twitter.com/bejcal/status/771010634074820608) but because the quality of the reads is exceptional high we do not increase this parameter)
+
++ maxN=0 (DADA2 requires no Ns)
++ truncQ=2 
++ maxEE=c(2,2)
+
+The `maxEE` parameter sets the maximum number of “expected errors” allowed in a read. 
+
+We use the `fastqPairedFilter` function to jointly filter the forward and reverse reads.
+
+###filter and trim
+```{r}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(filterpath, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filterpath, paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, 
+                     truncLen = c(fwrd_trim, rev_trim),
+                     maxN=0,
+                     maxEE=c(2,2),
+                     truncQ=2,
+                     rm.phix=TRUE,
+                     compress=TRUE, multithread=6) 
+out_df <- 
+out %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column(var = "Sample_name") %>% 
+  mutate(prct = signif(reads.out / reads.in * 100, 2)) %>% 
+  mutate(Sample_name = gsub("(.+?)_R1.fastq.gz","\\1", Sample_name))
+
+write_tsv(out_df, here("Data", "Sequencing_Data", run_name, primer, "ee_filter_stats.txt"))
+
+out_df
+```
+
+```{r}
+filt <- list.files(filterpath, full.names = T)
+
+filtFs <- filt[grepl("*_F_filt.fastq.gz", filt)]
+names(filtFs) <- gsub(".+filtered/(.+?)_F.+", "\\1", filtFs)
+
+filtRs <- filt[grepl("*_R_filt.fastq.gz", filt)]
+names(filtRs) <- gsub(".+filtered/(.+?)_F.+", "\\1", filtFs)
+```
+
+
+# Learn errors
+```{r}
+errF <- learnErrors(filtFs, multithread=6)
+errR <- learnErrors(filtRs, multithread=6)
+```
+
+
+```{r, cache=TRUE}
+plotErrors(errF, nominalQ=TRUE)
+ggsave(paste(plotpath, "errorPlot_F.pdf", sep = "/"))
+
+plotErrors(errR, nominalQ=TRUE)
+ggsave(paste(plotpath, "errorPlot_R.pdf", sep = "/"))
+```
+
+# Denoise
+```{r}
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+```
+
+```{r}
+
+denoise_stat <- 
+sapply(dadaFs, function(x) sum(getUniques((x)))) %>% 
+  data.frame(denoised = .) %>% 
+  tibble::rownames_to_column(var = "Sample_name") %>% 
+  left_join(select(out_df, Sample_name, reads.out)) %>% 
+  mutate(prct = round(denoised / reads.out*100, 2))
+  
+write_tsv(denoise_stat, here("Data", "Sequencing_Data", run_name, primer, "denoise_stat.txt"))
+
+denoise_stat
+```
+
+# Merge
+Merge paired reads
+Spurious sequence variants are further reduced by merging overlapping reads. 
+
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+
+merge_stat <- 
+lapply(mergers, function(x) {sum(x$abundance)}) %>% 
+  as_tibble() %>% 
+  pivot_longer(everything(),
+    names_to = "Sample_name",
+               values_to = "merged.out") %>% 
+  left_join(select(out_df, Sample_name, reads.out)) %>% 
+  mutate(prct = round(merged.out/reads.out * 100, 2))
+
+merge_stat %>% 
+write_tsv(here("Data", "Sequencing_Data", run_name, primer, "merge_stat"))
+
+merge_stat
+```
+
+# Construct sequence table:
+
+```{r, "Seqeunce table"}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+
+
+# Chimeras
+
+```{r, "Chimera removal", cache=TRUE}
+
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+
+write_rds(seqtab.nochim, here("Data", "Sequencing_Data", run_name,
+                              primer, "seqtab.nochim.rds"))
+
+dim(seqtab.nochim)
+
+seqtab.nochim <- read_rds( here("Data", "Sequencing_Data", run_name,
+                              primer, "seqtab.nochim.rds"))
+
+seqtab.nochim %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column(var = "Sample") %>%
+  write_tsv(., here("Data", "COI_ASV_redo.text"))
+
+```
+
+percentage of Chimeric reads: `r (1-(sum(seqtab.nochim)/sum(seqtab)))*100`
+
+percentage of Chimeric ASVs: `r (1-(ncol(seqtab.nochim)/ncol(seqtab)))*100`
+
+
+
+### length filtering
+
+```{r}
+data.frame(table(nchar(colnames(seqtab.nochim)))) %>% 
+  ggplot( aes(x = Var1, y = Freq))+
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = -90))+
+  labs(x = "length in bp", title = "histogramm of merged sequence lenghts")
+
+data.frame(table(nchar(colnames(seqtab.nochim)))) %>% 
+  filter(Var1 %in% c(305:323)) %>% 
+  ggplot( aes(x = Var1, y = Freq))+
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = -90))+
+  labs(x = "length in bp", title = "histogramm of merged sequence lenghts")
+
+#reads
+tibble(seq_length = nchar(colnames(seqtab.nochim)),
+           seq_abund = colSums(seqtab.nochim)) %>% 
+  group_by(seq_length) %>% 
+  summarise(len_abund = sum(seq_abund)) %>% 
+  ungroup() %>% 
+  mutate(exp = if_else(seq_length == 313, "exp", "unexp")) %>% #allowing for some variation aroound teh expected read length of 314
+  group_by(exp) %>% 
+  summarise(len_abund = sum(len_abund)) %>% 
+  mutate(prct = round(len_abund / sum(len_abund) * 100,2))
+ 
+
+```
+
+
+
+There is virtually no length variation in the targeted fragment of the COI gene. We therefore only keep fragments of the expected length. 
+
+```{r}
+seqtab.nochim_rlen <- seqtab.nochim[, nchar(colnames(seqtab.nochim)) == 313]
+```
+
+
+###track reads
+
+```{r}
+# summary of read numbers through DADA2 workflow
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(mergers, getN), rowSums(seqtab), rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoised", "merged", "tabled", "nonchim")
+rownames(track) <- sample.names
+
+
+
+track %>% 
+  as.data.frame %>% 
+  tibble::rownames_to_column(var="sample") %>% 
+  mutate("len_filtered" = rowSums(seqtab.nochim_rlen)) %>% 
+  mutate(across(!one_of("sample"),  function(x) x/input*100)) %>% 
+  pivot_longer(!one_of("sample"), names_to = "step", values_to = "reads") %>% 
+  mutate(step = factor(step, levels = c("input", "filtered", 
+                                        "denoised", "merged", 
+                                        "tabled", "nonchim", "len_filtered"))) %>%
+  ggplot(aes(x=step, y=reads, group = sample))+
+  geom_line(position = position_jitter(width = 0.1), alpha = 0.3, colour = "grey")+
+  geom_point(position = position_jitter(width = 0.1),
+             alpha = 0.3, shape = 21)+
+  geom_violin(fill = NA, aes(group = step))+
+  stat_summary(geom="line", fun.y="median", aes(group = 1), colour = "red")+
+  scale_y_continuous(breaks = seq(0,100,10), limits = c(0,102))+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = -30, hjust = 0))+
+  scale_colour_brewer(palette = "Set1")
+
+ggsave(paste(plotpath, "sequence_filtering.pdf", sep = "/"))
+```
+
+###export raw ASV table
+
+```{r}
+seqtab.nochim_rlen %>% 
+  as.data.frame %>% 
+  tibble::rownames_to_column(var = "Sample") %>% 
+  write_tsv(., here("Data", "COI_ASV_Plate2_raw.text"))
+```
+
+
+###check Plate Blanks
+
+We have 7 wells on the plate with only Milli-Q water that have been left blank on the plate but processed as all other samples during all lab-work. The contaminations in these wells are plate-specific.
+
+Number of reads in Blank samples
+```{r}
+seq_tab_blank_p2 <- seqtab.nochim_rlen[grepl("BLANK", rownames(seqtab.nochim_rlen)),]
+
+rowSums(seq_tab_blank_p2)
+
+```
+four of the six blanks have no reads that passed the quality control. One blank has 4 reads. Only one blank has a non-negligible number of reads - I check what sequences the reads belong to. 
+
+```{r}
+contam_seq <- colnames(seq_tab_blank_p2[, colSums(seq_tab_blank_p2) > 0])
+```
+
+There are 3 sequences that are present in the Blanks. I blast them against the NCBI nt database. 
+
+Seq1: Homo Sapiens (100% match)
+Seq 2: No good match
+Seq 3: Homo Sapiens (100% match)
+
+```{r}
+seqtab.nochim_clean <- seqtab.nochim_rlen
+
+seqtab.nochim_clean <- 
+seqtab.nochim_clean[!grepl("BLANK", rownames(seqtab.nochim_clean)),
+                    !colnames(seqtab.nochim_clean) %in% bold_ident$seq]
+
+dim(seqtab.nochim_rlen)
+dim(seqtab.nochim_clean)
+```
+
+###export ASVs table
+
+```{r}
+
+seqtab.nochim_clean %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column(var = "Sample") %>%
+  write_tsv(., here("Data", "COI_ASV_Plate2.text"))
+
+# seqtab.nochim_clean <- read_tsv(here("Data", "COI_ASV_Plate2.text"))
+# 
+# sample_names <- seqtab.nochim_clean$Sample
+# 
+# seqtab.nochim_clean <- as.matrix(seqtab.nochim_clean[,-1])
+# rownames(seqtab.nochim_clean) <- sample_names
+
+```
+
+
+export ASVs to Fasta file 
+
+```{r}
+seqs <- DNAStringSet(colnames(seqtab.nochim_clean))
+
+names(seqs) <- paste("seq", 
+                             formatC(1:length(seqs), flag = "0",
+                                     width = nchar(length(seqs))),
+                             sep = "_")
+
+writeXStringSet(seqs, here("Data", "COI_ASVs_Plate2.fasta"), format = "fasta")
+
+seqs <- readDNAStringSet(here("Data", "COI_ASVs_Plate2.fasta"))
+```
+
+
+#merge sequence tables
+
+```{r}
+
+redo <- read_tsv(here("Data", "COI_ASV_redo.text")) %>% 
+  filter(grepl("S", Sample)) %>% 
+  mutate(Sample = gsub("(\\w+)_.+", "\\1", Sample)) %>% 
+  pivot_longer(-Sample, names_to = "seq", values_to = "abund")
+  
+
+plate2 <- read_tsv(here("Data", "COI_ASV_Plate2.text")) %>% 
+  filter(!Sample %in% unique(redo$Sample)) %>% 
+  pivot_longer(-Sample, names_to = "seq", values_to = "abund") 
+
+#add samples that have been re-sequenced and pivot to wide table
+#this effectively merges the ASV tables as the seq names are the full sequence
+
+COI_ASV_j <- 
+  bind_rows(list(redo, plate2)) %>% 
+  group_by(seq) %>% 
+  filter(sum(abund) > 0) %>% 
+  pivot_wider(names_from = seq, values_from = abund, values_fill = 0)
+
+```
+
+###export ASVs table
+
+```{r}
+
+COI_ASV_j %>% 
+  write_tsv(., here("Data", "COI_ASV.text"))
+
+#seqtab.nochim_rlen <- readRDS(here("Data", "COI_ASV.text"))
+```
+
+
+export ASVs to Fasta file 
+
+```{r}
+seqs <- DNAStringSet(colnames(COI_ASV_j[,-1]))
+
+names(seqs) <- paste("seq", 
+                             formatC(1:length(seqs), flag = "0",
+                                     width = nchar(length(seqs))),
+                             sep = "_")
+
+writeXStringSet(seqs, here("Data", "COI_ASVs.fasta"), format = "fasta")
+
+#seqs <- readDNAStringSet(here("Data", "COI_ASVs.fasta"))
+```
+
+
+```{r}
+colnames(COI_ASV_j) <- c("Sample", names(seqs))
+```
+
+###Vsearch clustering
+
+Vsearch clustering
+
+test clustering threshold
+```{r}
+
+RES <- tibble(ID = numeric(),
+       n_cluster = numeric())
+
+for (i in c(seq(0.9, 0.99, 0.01), 0.993, 0.996, 1)){
+  
+  system(paste(
+    "/Applications/vsearch/bin/vsearch --cluster_fast ",
+    shQuote(here("Data", "COI_ASVs.fasta")),
+    " --centroids ",
+    shQuote(here("Data", "ASVs_clean_clustered.fasta")),
+    " --id ", i, sep = ""))
+  
+  L <- system(
+    paste("grep -c '^>' ",
+    shQuote(here("Data", "ASVs_clean_clustered.fasta")), sep = ""),
+    intern = T) 
+  
+  file.remove(shQuote(here("Data", "ASVs_clean_clustered.fasta")))
+  
+  RES_temp <- tibble(ID = i,
+                     n_cluster = as.numeric(L))
+  
+  RES <- rbind(RES, RES_temp)
+  
+}
+
+RES %>% 
+  mutate(ID = 100*ID) %>% 
+  ggplot(aes(x = ID, y = n_cluster))+
+  geom_point()+
+  theme_bw()+
+  scale_x_continuous(
+    breaks = c(seq(90,99,1), 99.3, 99.6, 100),
+    labels = c(seq(90,99,1), 99.3, 99.6, 100))+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))+
+  labs(x = "OTU cluster threshold (% identity)", y = "number of OTUs")
+
+ggsave(here("figures", "clusterthreshold.pdf"), width = 6, height = 6)
+
+```
+
+We see there is steep decline of OTU numbers when clustering at ~99% after which the decline is more or less linear with clustering threshold. This suggest that clustering at 99% collapses remaining artificial diversity and within species variability but further clustering only has a linear effect on diversity. 
+
+Given that, we choose SWARM for clustering which implements a single-linkage clustering method with variable threshold (but often corresponds to a cluster threshold >99%)
+
+
+###Swarm3
+
+We use swarm for single linkage clustering of the ASVs. The method is described here:
+
+> Mahé F, Rognes T, Quince C, Vargas C de, Dunthorn M. 2015 Swarm v2: highly-scalable and high-resolution amplicon clustering. PeerJ 3, e1420. (doi:10.7717/peerj.1420)
+
+The github is [here](https://github.com/torognes/swarm)
+
+
+Swarm needs a fasta file with size annotation as input. It just separates the size by a "_"
+
+```{r}
+seqs_size <- 
+  colSums(COI_ASV_j[,-1]) %>% 
+  data.frame(size = .) %>% 
+  tibble::rownames_to_column(var = "seq") %>% 
+  mutate(new_name = gsub("_", "", seq)) %>% 
+  mutate(new_name = paste(new_name, size, sep = "_"))
+
+#make sure seqeucnes are in ocrrect order
+seqs <- seqs[seqs_size$seq]
+
+#rename
+names(seqs) <- seqs_size$new_name
+
+#export
+writeXStringSet(seqs, here("Data", "COI_ASVs_swarm_in.fasta"), format = "fasta")
+
+```
+
+```{r}
+tmp <- 
+system(paste(
+  "/Applications/swarm-3.1.0/bin/swarm -d 1 -f -t 8 -w",
+  here("Data", "ASVs_swarm_out.fasta"), 
+  "-u", here("Data", "ASVs_swarm_cluster.txt"),
+  here("Data", "COI_ASVs_swarm_in.fasta")
+  , sep = " ")
+  , intern = TRUE)
+
+```
+
+
+The ITS_ASVs_swarm_cluster.txt file tells us which sequences have been clustered
+
+column 09 gives the original sequence name
+column 10 gives the centroid sequence to which it has been clustered
+column 01 tells us if the sequence is itself a centroid sequence ("S") or clustered to a centroid ("H")
+column 04 gives the % identity with the centroid (here between 100% and 99%)
+
+```{r}
+Cluster_ID <- read_delim(here("Data", "ASVs_swarm_cluster.txt"), delim = "\t", col_names = FALSE)
+
+#filter only sequences that have been clustered
+Cluster_ID <- 
+Cluster_ID %>% 
+  dplyr::rename(seq = X9, Type = X1, match = X10, pident = X4) %>% 
+  select(seq, Type, match, pident) %>% 
+  filter(Type == "H" ) %>% 
+  arrange(match)
+
+Cluster_ID %>% 
+  group_by(match) %>% 
+  summarise(pident = min(pident)) %>% 
+  ggplot(aes(x = pident))+
+  geom_histogram(stat="count")
+```
+
+
+```{r}
+#rename seqs to match sequence table
+Cluster_ID <- 
+Cluster_ID %>% 
+  mutate(across(one_of("seq", "match"), function(x){
+    gsub("(seq)(\\d+)_\\d+", "\\1_\\2", x)}))
+
+#split by cluster centroid
+Cluster_list <- split(Cluster_ID, Cluster_ID$match)
+
+
+#sum abundance of clustered sequences
+ASV_list <- 
+  lapply(Cluster_list, function(x) {
+  S_seq <- unique(x$match)
+  C_seqs <- x$seq
+  COI_ASV_j[,S_seq] <- rowSums(COI_ASV_j[,c(S_seq,C_seqs)])
+})
+
+#create new ASV table with only the centroid sequences
+ASV_sw <- COI_ASV_j
+ASV_sw[,names(ASV_list)] <- bind_rows(ASV_list)
+ASV_sw <- ASV_sw[, which(!colnames(ASV_sw) %in% Cluster_ID$seq)] 
+
+#export ASV table
+ASV_sw %>% 
+  write.table(., here("Data", "COI_ASV_j_swarm.text"))
+
+ASV_sw <- read.table(here("Data", "COI_ASV_j_swarm.text"))
+```
+
+update fasta file with sequence centroids
+```{r}
+seqs <- readDNAStringSet(here("Data", "ASVs_swarm_out.fasta"))
+
+names(seqs) <- gsub("(seq)(\\d+)_\\d+", "\\1_\\2", names(seqs))
+
+sum(!names(seqs) %in% colnames(ASV_sw[,-1]))
+
+writeXStringSet(seqs, here("Data", "ASV_swarm.fasta"))
+```
+
+read_files
+```{r}
+seqs <- readDNAStringSet(here("Data", "ASV_swarm.fasta"))
+
+ASV_sw <- read.table(here("Data", "COI_ASV_j_swarm.text"))
+```
+
+#taxonomy
+
+1.Leray M, Knowlton N, Machida RJ. In press. MIDORI2: A collection of quality controlled, preformatted, and regularly updated reference databases for taxonomic assignment of eukaryotic mitochondrial sequences. Environmental DNA n/a. (doi:10.1002/edn3.303)
+
+To replicate the taxonomic assignment you need to download the same version of the reference file from here: 
+https://www.reference-midori.info/download.php
+
+Reference file: MIDORI2_UNIQ_NUC_SP_GB259_CO1_SINTAX.fasta
+
+##Sintax
+
+```{r}
+system(paste(
+  
+  "/Applications/vsearch/bin/vsearch --sintax", here("Data", "ASV_swarm.fasta"), "--db", here("Data", "MIDORI2_UNIQ_NUC_SP_GB259_CO1_SINTAX.fasta"), "--sintax_cutoff 0.1 --tabbedout", here("Data", "COI_midori_tax.txt"), sep = " "
+
+))
+```
+
+```{r}
+Sintax_taxa <- read_tsv(here("Data", "COI_midori_tax.txt"), 
+                        col_names = FALSE) %>% 
+  select(1:2)
+
+colnames(Sintax_taxa) <- c("seq", "tax")
+
+Sintax_prep <- 
+  Sintax_taxa %>% 
+  mutate(tax = ifelse(is.na(tax), "k:NA_0(0)", tax)) %>% 
+  mutate(tax = strsplit(tax, ",")) %>% 
+  unnest(tax) %>% 
+  group_by(seq) %>% 
+ # dplyr::slice(-1) %>% 
+  mutate(taxonomy_name = gsub("\\w:(.+)_.+", "\\1", tax),
+         taxonomy_level = gsub("(\\w):.+", "\\1", tax),
+         taxonomy_conf = gsub(".+\\((.+)\\)", "\\1", tax)) %>% 
+  mutate(taxonomy_level = case_when(
+    taxonomy_level == "k" ~ "kingdom",
+    taxonomy_level == "p" ~ "phylum",
+    taxonomy_level == "c" ~ "class",
+    taxonomy_level == "o" ~ "order",
+    taxonomy_level == "f" ~ "family",
+    taxonomy_level == "g" ~ "genus",
+    taxonomy_level == "s" ~ "species"))
+
+#get table with all assignments (even the unlikely ones)
+Sintax_taxa_table_full <- 
+ Sintax_prep %>% 
+  select(-tax, -taxonomy_conf) %>% 
+  pivot_wider(names_from = taxonomy_level, values_from = taxonomy_name)
+
+#get table with probabilities for each assignment
+Sintax_taxa_table_prob <- 
+  Sintax_prep %>% 
+  select(-tax, -taxonomy_name) %>% 
+  pivot_wider(names_from = taxonomy_level, values_from = taxonomy_conf)
+```
+
+
+##rgbif
+
+harmonizing taxonomy with gbif backbone
+
+```{r}
+
+# The Sintax taxonomy file has no empty species slots. We only provide the species and the Phylum columns and let rgbif figure out the rest
+
+Sintax_taxa_table_full_gbif <- 
+  Sintax_taxa_table_full %>% 
+  mutate(across(-1, function(x) ifelse(grepl("phylum|class|order|family|genus", x),NA,x))) %>% 
+  dplyr::rename(name = species)
+
+#harmonize against gbif backbone. 
+gbif_specnames <- 
+  name_backbone_checklist(name_data = Sintax_taxa_table_full_gbif)
+
+#check for problems
+gbif_specnames %>% 
+  mutate(seq = Sintax_taxa_table_full$seq) %>% 
+  relocate(seq,.before=0) %>% 
+  filter(confidence < 90) 
+
+
+Sintax_taxa_table_full_gbif <-  
+  gbif_specnames %>% 
+  select(kingdom, phylum, class, order, family, genus, species) %>% 
+  mutate(seq = Sintax_taxa_table_full$seq) %>% 
+  relocate(seq)
+
+```
+
+export
+
+```{r}
+write_tsv(Sintax_taxa_table_full_gbif, here("Data", "COI_Sintax_tax.txt"))
+write_tsv(Sintax_taxa_table_prob, here("Data", "COI_Sintax_prob.txt"))
+
+Sintax_taxa_table_full_gbif <- read_tsv(here("Data", "COI_Sintax_tax.txt"))
+Sintax_taxa_table_prob <- read_tsv(here("Data", "COI_Sintax_prob.txt"))
+```
+
+```{r}
+COI_taxa_80 <- Sintax_taxa_table_full_gbif
+COI_taxa_80[Sintax_taxa_table_prob < 0.8] <- NA_character_ 
+
+COI_taxa_80 <- 
+  COI_taxa_80 %>% 
+  mutate(across(everything(), function(x){gsub("NA", NA, x, fixed = TRUE)}))
+
+write_tsv(COI_taxa_80, here("Data", "COI_Sintax_80.txt"))
+COI_taxa_80 <- read_tsv(here("Data", "COI_Sintax_80.txt"))
+```
+
+```{r}
+COI_taxa_80 %>% 
+  group_by(phylum) %>% 
+  summarise(n = n())
+```
+
+## check unassigned species
+
+```{r}
+no_phylum <- 
+COI_taxa_80 %>% 
+  filter(is.na(phylum)) %>% 
+  pull(seq)
+
+top_no_phylum <- sort(colSums(ASV_sw[,no_phylum] > 0), decreasing = T)[1:10] %>% names()
+
+#write to blast
+seqs[top_no_phylum] %>% writeXStringSet("~/Downloads/fasta_for_blast.fasta")
+
+Sintax_taxa_table_full_gbif %>% filter(seq %in% top_no_phylum)
+Sintax_taxa_table_prob %>% filter(seq %in% top_no_phylum)
+```
+
+## merge species
+
+cluster sequences assigned to same species or genus (if species is NA)
+
+collapse reads from same species
+```{r}
+#show same genus / species assigned to more than one OTU
+  COI_taxa_80 %>% 
+  group_by(genus, species) %>% 
+  filter(n() > 1) %>% 
+  arrange(genus, species)
+```
+
+We use Phyloseq to merge ASVs with the same taxonomic assignment at species level, or genus level if a species level assignment is missing. If both are missing, we do not merge the sequences!
+
+```{r}
+
+ASV_ps <- ASV_sw[,-1]
+rownames(ASV_ps) <- ASV_sw$Sample
+
+COI_taxa_80_ps <- 
+  COI_taxa_80 %>% 
+  filter(!is.na(genus)) %>% 
+  mutate(species = case_when(is.na(species) & !is.na(genus) ~ paste(genus, "sp."),
+                             TRUE ~ species)) %>% 
+  select(-seq) %>% 
+  as.matrix()
+
+rownames(COI_taxa_80_ps) <- filter(COI_taxa_80, !is.na(genus))$seq
+
+ps_obj <- phyloseq(otu_table(ASV_ps, taxa_are_rows = FALSE),
+                   tax_table(COI_taxa_80_ps))
+
+ps_glom <- tax_glom(ps_obj, taxrank="species", NArm=FALSE)
+
+COI_taxa_80_glom <- 
+  as.data.frame(tax_table(ps_glom)) %>% 
+  tibble::rownames_to_column("seq")
+
+ASW_glom <- 
+  as.data.frame(otu_table(ps_glom)) %>% 
+  tibble::rownames_to_column("Sample")
+
+COI_taxa_80_glom_j <- 
+  COI_taxa_80 %>% 
+  filter(!seq %in%  rownames(COI_taxa_80_ps)) %>% 
+  bind_rows(COI_taxa_80_glom,.)
+
+ASW_glom_j <- 
+  ASV_sw %>% 
+  select(!one_of(rownames(COI_taxa_80_ps))) %>% 
+  left_join(ASW_glom,.)
+  
+```
+
+
+export
+```{r}
+write_tsv(COI_taxa_80_glom_j, here("Data", "COI_taxa_80_glom.txt"))
+
+write_tsv(ASW_glom_j, here("Data", "COI_ASW_glom.txt"))
+```
+
+##check Midori
+
+The chose COI primer amplify a lot of fungal COI barcodes. However, COI is not a usual barcode or fungi, wherefore the reference databases are very incomplete. 
+
+```{r}
+MIDORI <- readDNAStringSet(here("Data", "MIDORI2_UNIQ_NUC_SP_GB259_CO1_SINTAX.fasta")) %>% names()
+
+MIDORI <- tibble(names = MIDORI)
+
+library(data.table)
+
+# Assuming your data frame is named 'df' and the column to separate is 'column_to_split'
+test <- setDT(MIDORI)  # Convert to a data.table 
+
+MIDORI[, c("id", "kingdom", "phylum", "class", "order",  "family", "genus", "species") := 
+        tstrsplit(names, "\\w:", type.convert = TRUE)] 
+
+gsub("(.+)_.+$", "\\1", MIDORI$phylum) %>% table()
+
+MIDORI <- 
+MIDORI %>% 
+  select(-names) %>% 
+  group_by(kingdom, phylum, class, order, family, genus, species) %>% 
+  summarise(n_seqs = n())
+  
+
+MIDORI %>% 
+  group_by(phylum) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n))
+```
+
+There are only 833 unique species of Ascomycota and 434 Basidiomycota in the database (compared to 689451 Arthropoda and 48805 Chordata). This is because COI is generally not sequenced as barcode gene for fungi and explains the large number of unassigned ASVs - even at phylum level.  

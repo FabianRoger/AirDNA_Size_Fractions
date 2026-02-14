@@ -1,0 +1,631 @@
+---
+title: "airborne eDNA - 2nd run + Isamels sample"
+author: "Fabian Roger"
+date: "2/4/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE, cache=TRUE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+
+```{r, message = FALSE}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(here)
+library(ggplot2)
+library(ggrepel)
+library(stringr)
+library(dada2)
+library(ShortRead)
+
+#helper functions for sequence analyis
+source(here("Scripts", "Seq_analysis_helper.R"))
+```
+
+#dada2
+This script follows the [DADA2 Pipeline Tutorial (1.12)](https://benjjneb.github.io/dada2/tutorial.html) 
+The original article can be found [here](http://rdcu.be/ipGh)
+
+The script was written with DADA2 version 1.18.0
+
+
+#set-up
+
+```{r}
+run_name <- "220912_M06272_0096_000000000-KKGP7"
+primer <- "Leray"
+
+Sample_meta <- read_tsv(here("Data", "Meta_reseq.txt"))
+
+#path to demultiplexed sequences
+path_demulti <- here("Data", "Sequencing_Data", run_name, "demultiplexed")
+
+#create directories for primer analysis
+path_primer <- here("Data", "Sequencing_Data", run_name, primer)
+dir.create_ifnot(path_primer)
+
+#path to plots
+plotpath <- here("Data", "Sequencing_Data", run_name, primer, "plots")
+dir.create_ifnot(plotpath)
+```
+
+
+# primer seq
+
+mICOIintF : GGWACWGGWTGAACWGTWTAYCCYCC
+jgHCO2198 : TAIACYTCIGGRTGICCRAARAAYCA
+
+```{r}
+Fwrd_primer <- "GGWACWGGWTGAACWGTWTAYCCYCC"
+
+Rev_primer <- "TAIACYTCIGGRTGICCRAARAAYCA"
+
+#substitute I with N as it Deoxyinosine (I) functions as universal base in this primer
+Rev_primer <- gsub("I", "N", Rev_primer)
+```
+
+```{r}
+nchar(Fwrd_primer)
+nchar(Rev_primer)
+```
+
+On the re-sequencing run we sequenced more samples and markers than analysed here. We filter for the relevant files.
+
+```{r}
+Sample_meta_min <- 
+Sample_meta %>%
+  filter(Primer == "Leray") %>% 
+  mutate(Sample_type = case_when(grepl("BLANK|\\(-\\)", Sample_name) ~ "control",
+                                 TRUE ~ "sample")) %>% 
+  filter(grepl("^S|BLANK", Sample_name))
+
+Sample_meta_min
+```
+
+# Trimming
+
+Trimming will do three things 
+
+1) it will recognize the primer sequences at the start of the reads and trim them
+
+2) (depending on insert size) it will recognize the reverse complement of the primers at the end of the read 
+
+3) it will discard sequences that are too short (e.g. primer dimers). 
+
+We check where the primers are in the reads and in what orientation
+
+The presence of ambiguous bases (Ns) in the sequencing reads makes accurate mapping of short primer sequences difficult. We are going to “pre-filter” the sequences just to remove those with Ns, but perform no other filtering.
+
+```{r}
+
+#list files
+dm_files <- list.files(path_demulti, full.names = F)
+
+#grep for sample files with Leray primer HERE: other files are allready removed
+#dm_files <- dm_files[grepl(
+#  paste0(Sample_meta_min$Sample_name, collapse = "|"), dm_files)]
+
+#sort in forward and reverse reads
+forward_raw <- dm_files[grepl("_R1.fastq.gz", dm_files)]
+reverse_raw <- dm_files[grepl("_R2.fastq.gz", dm_files)]
+
+#create directories for N filtered sequences
+N_path <- here("Data", "Sequencing_Data", run_name, primer, "N_filtred")
+dir.create_ifnot(N_path)
+
+# Get sample names from forward read filenames
+sample.names <- 
+  sapply(forward_raw, function(x) gsub("(.+)_R1.fastq.gz", "\\1", x), USE.NAMES = FALSE)
+```
+
+
+## filter N
+
+pre-filter sequences to remove sequences with Ns
+
+```{r}
+# Place filtered files in N_filtered subdirectory
+filtFs <- file.path(N_path, paste0(sample.names, "_R1_Nfilt.fastq.gz"))
+filtRs <- file.path(N_path, paste0(sample.names, "_R2_Nfilt.fastq.gz"))
+
+# path to input files
+fnFs <- here(path_demulti, forward_raw)
+fnRs <- here(path_demulti, reverse_raw)
+
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, 
+                     maxN=0,
+                     rm.phix=c(TRUE,TRUE),
+                     compress=TRUE, 
+                     multithread=6)
+```
+
+
+```{r}
+
+N_filter_stats <- 
+out %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column(var = "Sample_name") %>% 
+  mutate(Sample_name =  gsub("(.+)_R1.fastq.gz", "\\1", Sample_name)) %>% 
+  mutate(prct_N = round(100 - reads.out/reads.in*100,2)) %>% 
+  left_join(Sample_meta_min) %>% 
+  arrange(Author)
+
+N_filter_stats %>% 
+write_tsv(here("Data", "Sequencing_Data", run_name, primer, "N_filter_stats.txt"))
+
+N_filter_stats
+```
+
+# trim primer
+
+## look for primers
+
+get all orientations of the primers
+```{r}
+Fwrd.orients <- allOrients(Fwrd_primer) 
+Rev.orients <- allOrients(Rev_primer)
+```
+
+
+check for primers in one true sample file, avoiding negative controls. 
+```{r}
+test_sample <- 
+N_filter_stats  %>% 
+  filter(abs(reads.out - median(reads.out)) == min(abs(reads.out - median(reads.out)))) %>% 
+  dplyr::slice(1) %>% 
+  pull(Sample_name)
+  
+
+test_sampleF <- filtFs[test_sample]
+test_sampleR <- filtRs[test_sample]
+```
+
+```{r}
+Primer_on_reads <- 
+rbind(FWD.ForwardReads = sapply(Fwrd.orients, primerHits, 
+                                fn = test_sampleF), 
+    FWD.ReverseReads = sapply(Fwrd.orients, primerHits, 
+                              fn =test_sampleR), 
+    REV.ForwardReads = sapply(Rev.orients, primerHits, 
+                              fn = test_sampleF), 
+    REV.ReverseReads = sapply(Rev.orients, primerHits, 
+                              fn = test_sampleR))
+
+Primer_on_reads
+```
+
+We find the forward primer on the first read and the reverse primer on the second read as well as the reverse complements on a few other reads (read-through). The fragment has no length variation (protein coding gene) and is longer than the single end read-length so we should have no read-through and indeed it is very rare. The sequences with read-through are likely remaining primer-dimers and will be filtered out later. 
+
+--> we still trim primers on both ends (doesn't hurt)
+
+## trim primer
+I use [cutadapt](https://cutadapt.readthedocs.io/en/stable/guide.html) to trim the primers from the sequences and filter only sequences with detectable Primers. 
+
+setting up variables:
+
+I read in the N filtered sequencing files  and sort them into first and second reads
+
+I also create an output folder for the filtered sequences
+```{r}
+
+#list files (filtered reads without N's)
+N_trim_files <- list.files(N_path, full.names = F)
+
+names(N_trim_files) <- gsub("(.+?)_R1.+", "\\1", N_trim_files)
+
+#sort in forward and reverse reads
+forward_N_trim <- N_trim_files[grepl("_R1_Nfilt.fastq.gz", N_trim_files)]
+reverse_N_trim <- N_trim_files[grepl("_R2_Nfilt.fastq.gz", N_trim_files)]
+
+#create directories for filtered sequences
+trimmed_path <- here("Data","Sequencing_Data", run_name, primer, "trimmed")
+
+dir.create_ifnot(trimmed_path)
+
+```
+
+### trim
+
+we filter reads below 200 bp with primer, which corresponds to ~250 bp without (below the expected lower end of the fragment size of 314 bp)
+
+```{r}
+#minimum length for sequences after trimming (shorter sequences are discarded)
+
+minlength <- 200
+```
+
+
+run cutadapt 
+
+-g specifies that the primer adaptor is at the 5' end of the read.
+
+> 5’ adapters preceed the sequence of interest
+
+```{r}
+
+#number of cores
+Cores <- 6
+
+cutadapt_out <- vector(mode = "list", length = length(forward_N_trim))
+names(cutadapt_out) <- names(forward_N_trim)
+
+for (i in seq_along(forward_N_trim)) {
+  
+  message(paste("processing file", i, "out of", length(forward_N_trim), sep=" "))
+
+# will sort COI in separate file below
+  temp <- 
+system(
+paste('/opt/homebrew/bin/cutadapt -a ', #replace by your path to cutadapt
+      '"', Fwrd.orients['Forward'],';required;min_overlap=12','"','...', Rev.orients['RevComp'],
+      ' -A ', '"',Rev.orients['Forward'],';required;min_overlap=12','"', '...', Fwrd.orients['RevComp'],
+      ' --discard-untrimmed',
+      ' --minimum-length=', minlength, #minimum length for sequences after trimming
+      ' --cores=', Cores, # Number of cores to use
+      ' -o ', here(trimmed_path, forward_N_trim[i]),
+      ' -p ', here(trimmed_path, reverse_N_trim[i]), ' ',
+      here(N_path,forward_N_trim[i]),' ',
+      here(N_path,reverse_N_trim[i]),
+      sep = ''
+      ), intern = TRUE
+)
+
+cutadapt_out[[i]] <- Cutadapt_parser(temp)
+}
+
+cutadapt_out_df <- bind_rows(cutadapt_out, .id = "Sample_name")
+
+cutadapt_out_df %>% 
+write_tsv(here("Data", "Sequencing_Data", run_name, primer, "Primer_trimming_stats.txt"))
+
+cutadapt_out_df
+```
+most samples have >90% of their reads passing the filter with the excluded reads being almost all too short (<150 bp after trimming)
+
+
+#Filter
+
+filter trimmed reads
+```{r}
+filterpath <- here("Data", "Sequencing_Data", run_name, primer, "filtered")
+dir.create_ifnot(filterpath)
+```
+
+
+```{r, "sort fwrd and rev", cache=TRUE}
+
+fnFs <- sort(list.files(trimmed_path, pattern="_R1_Nfilt.fastq.gz", full.names = TRUE)) # Just the forward read files
+fnRs <- sort(list.files(trimmed_path, pattern="_R2_Nfilt.fastq.gz", full.names = TRUE)) # Just the reverse read files
+
+# Get sample names from forward read filenames
+sample.names <- 
+   sapply(fnFs, function(x) gsub(".+trimmed/(.+)_R1.Nfilt.fastq.gz", "\\1", x), USE.NAMES = FALSE)
+
+```
+
+###quality profiles
+
+Visualize the quality profile of the forward reads
+
+```{r}
+max_read_sample <- 
+cutadapt_out_df %>% 
+  filter(Pairs_written == max(Pairs_written)) %>% 
+  pull(Sample_name)
+```
+
+
+```{r, "plot quality of reads", cache=TRUE}
+# plot one foward and one reverse read in the rapport
+plotQualityProfile(fnFs[grepl(max_read_sample,fnFs)])+
+  scale_y_continuous(limits = c(0,40))+
+  scale_x_continuous(breaks = seq(0,250, 20))+
+  geom_hline(yintercept = 30, colour = "grey", linetype = "dashed")+
+  geom_hline(yintercept = 20, colour = "grey", linetype = "dashed")+
+  labs(title = paste(sample.names[1], "foward", sep = " - " ))
+
+plotQualityProfile(fnRs[grepl(max_read_sample,fnFs)])+
+  scale_y_continuous(limits = c(0,40))+
+  scale_x_continuous(breaks = seq(0,250, 20))+
+  geom_hline(yintercept = 30, colour = "grey", linetype = "dashed")+
+  geom_hline(yintercept = 20, colour = "grey", linetype = "dashed")+
+  labs(title = paste(sample.names[1], "reverse", sep = " - "))
+```
+
+The quality of the reads is very high for the length of the expected fragment size (~220 bp)
+
+### merged read length
+To decide on appropriate trimming parameters, we check the distribution of the merged read-lengths.
+
+we don't need the merged reads (DADA2 needs unmerged reads) so we merge them on them fly and just store the length distributions
+
+
+```{r}
+#merge first file with vsearch
+
+  system(
+  paste(
+    "/Applications/vsearch/bin/vsearch --fastq_mergepairs ", fnFs[grepl(max_read_sample,fnFs)], 
+    " --reverse ", fnRs[grepl(max_read_sample,fnRs)], 
+    " --fastaout", here("Data","Sequencing_Data", run_name, primer, "test_merge.fasta"), 
+    "--fastq_allowmergestagger"
+    ), intern = TRUE
+  )
+  
+  #read file
+file_merged <- readDNAStringSet(here("Data", "Sequencing_Data", run_name, primer, "test_merge.fasta"))
+
+
+table(width(file_merged)) %>% 
+  as.data.frame() %>% 
+  mutate(across(one_of("Var1", "Freq"), function(x) as.numeric(as.character(x)))) %>% 
+  arrange(desc(Freq)) %>% 
+  mutate(prct = Freq / sum(Freq)*100) %>% 
+  mutate(rank = 1:n()) %>% 
+  mutate(Label = case_when( rank < 6 ~ paste(Var1, "(",round(prct,1), " %",")", sep = ""),
+                   TRUE ~ NA_character_)) %>% 
+    ggplot(aes(x = Var1, y = Freq))+
+  geom_line(colour = "darkgrey", alpha = 0.5)+
+  geom_text_repel(aes(label = Label))+
+  geom_point(data = ~filter(.x, !is.na(Label)), colour = "red", size = 0.5)+
+  theme_bw()+
+  scale_x_continuous(limits = c(0,500))
+
+  
+```
+almost all reads have the expected fragment length of 313 basepairs
+
+
+
+```{r}
+frag_len <- 314
+fwrd_len <- 250-26
+rev_len <- 250-26
+fwrd_trim <- 200
+rev_trim <- 200
+
+
+ggplot(data = tibble(x = c(1,frag_len), y = c(1,5)), aes(x = x, y = y))+
+  geom_blank()+
+  geom_segment(x = 0, xend = frag_len, y = 2, yend = 2)+ #fragment
+  geom_segment(x = 0, xend = fwrd_len, y = 3, yend = 3)+ #fwrd
+  geom_segment(x = frag_len-rev_len, xend = frag_len, y = 3.5, yend = 3.5)+ #rev
+  geom_segment(x = fwrd_trim, xend = fwrd_len, y = 3, yend = 3, 
+               colour = "red", size = 2, alpha = 0.2)+ #fwrd trim
+  geom_segment(x = frag_len-rev_trim, xend = frag_len-rev_len,
+               y = 3.5, yend = 3.5, 
+               colour = "red", size = 3, alpha = 0.2)+ #rev trim
+  geom_segment(x = frag_len-rev_trim, xend = fwrd_trim, y = 2, 
+               yend = 2, colour = "green", size= 3, alpha = 0.2)+ #overlap
+  geom_text(x = ((frag_len-rev_trim) + fwrd_trim)/2, y = 2.25, 
+            label = paste(as.character(fwrd_trim+rev_trim-frag_len), "bp"),
+            colour = "blue", size= 5)+
+  theme_void()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_x_continuous(breaks = seq(0,frag_len, 12))
+```
+The qualilty is very high, I only trim the last 30 bp, keeping 200 on each reads
+
+
+The filtering parameters we’ll use are standard (DADA is [robust to low quality sequences](https://twitter.com/bejcal/status/771010634074820608) but because the quality of the reads is exceptional high we do not increase this parameter)
+
++ maxN=0 (DADA2 requires no Ns)
++ truncQ=2 
++ maxEE=c(2,2)
+
+The `maxEE` parameter sets the maximum number of “expected errors” allowed in a read. 
+
+We use the `fastqPairedFilter` function to jointly filter the forward and reverse reads.
+
+###filter and trim
+```{r}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(filterpath, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filterpath, paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, 
+                     truncLen = c(fwrd_trim, rev_trim),
+                     maxN=0,
+                     maxEE=c(2,2),
+                     truncQ=2,
+                     rm.phix=TRUE,
+                     compress=TRUE, multithread=6) 
+out_df <- 
+out %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column(var = "Sample_name") %>% 
+  mutate(prct = signif(reads.out / reads.in * 100, 2)) %>% 
+  mutate(Sample_name = gsub("(.+?)_R1_Nfilt.fastq.gz","\\1", Sample_name))
+
+write_tsv(out_df, here("Data", "Sequencing_Data", run_name, primer, "ee_filter_stats.txt"))
+
+out_df
+```
+
+```{r}
+filt <- list.files(filterpath, full.names = T)
+
+filtFs <- filt[grepl("*_F_filt.fastq.gz", filt)]
+names(filtFs) <- gsub(".+filtered/(.+?)_F.+", "\\1", filtFs)
+
+filtRs <- filt[grepl("*_R_filt.fastq.gz", filt)]
+names(filtRs) <- gsub(".+filtered/(.+?)_F.+", "\\1", filtFs)
+```
+
+
+# Learn errors
+```{r}
+errF <- learnErrors(filtFs, multithread=6)
+errR <- learnErrors(filtRs, multithread=6)
+```
+
+
+```{r, cache=TRUE}
+plotErrors(errF, nominalQ=TRUE)
+ggsave(paste(plotpath, "errorPlot_F.pdf", sep = "/"))
+
+plotErrors(errR, nominalQ=TRUE)
+ggsave(paste(plotpath, "errorPlot_R.pdf", sep = "/"))
+```
+
+# Denoise
+```{r}
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+```
+
+```{r}
+
+denoise_stat <- 
+sapply(dadaFs, function(x) sum(getUniques((x)))) %>% 
+  data.frame(denoised = .) %>% 
+  tibble::rownames_to_column(var = "Sample_name") %>% 
+  left_join(select(out_df, Sample_name, reads.out)) %>% 
+  mutate(prct = round(denoised / reads.out*100, 2))
+  
+write_tsv(denoise_stat, here("Data", "Sequencing_Data", run_name, primer, "denoise_stat.txt"))
+
+denoise_stat
+```
+
+# Merge
+Merge paired reads
+Spurious sequence variants are further reduced by merging overlapping reads. 
+
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+
+merge_stat <- 
+lapply(mergers, function(x) {sum(x$abundance)}) %>% 
+  as_tibble() %>% 
+  pivot_longer(everything(),
+    names_to = "Sample_name",
+               values_to = "merged.out") %>% 
+  left_join(select(out_df, Sample_name, reads.out)) %>% 
+  mutate(prct = round(merged.out/reads.out * 100, 2))
+
+merge_stat %>% 
+write_tsv(here("Data", "Sequencing_Data", run_name, primer, "merge_stat"))
+
+merge_stat
+```
+
+# Construct sequence table:
+
+```{r, "Seqeunce table"}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+
+
+# Chimeras
+
+```{r, "Chimera removal", cache=TRUE}
+
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+
+write_rds(seqtab.nochim, here("Data", "Sequencing_Data", run_name,
+                              primer, "seqtab.nochim.rds"))
+
+dim(seqtab.nochim)
+
+seqtab.nochim <- read_rds( here("Data", "Sequencing_Data", run_name,
+                              primer, "seqtab.nochim.rds"))
+
+seqtab.nochim %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column(var = "Sample") %>%
+  write_tsv(., here("Data", "COI_ASV_redo.text"))
+
+```
+
+### length filtering
+
+```{r}
+data.frame(table(nchar(colnames(seqtab.nochim)))) %>% 
+  ggplot( aes(x = Var1, y = Freq))+
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = -90))+
+  labs(x = "length in bp", title = "histogramm of merged sequence lenghts")
+
+data.frame(table(nchar(colnames(seqtab.nochim)))) %>% 
+  filter(Var1 %in% c(305:323)) %>% 
+  ggplot( aes(x = Var1, y = Freq))+
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = -90))+
+  labs(x = "length in bp", title = "histogramm of merged sequence lenghts")
+
+#reads
+tibble(seq_length = nchar(colnames(seqtab.nochim)),
+           seq_abund = colSums(seqtab.nochim)) %>% 
+  group_by(seq_length) %>% 
+  summarise(len_abund = sum(seq_abund)) %>% 
+  ungroup() %>% 
+  mutate(exp = if_else(seq_length == 313, "exp", "unexp")) %>% #allowing for some variation around the expected read length of 314
+  group_by(exp) %>% 
+  summarise(len_abund = sum(len_abund)) %>% 
+  mutate(prct = round(len_abund / sum(len_abund) * 100,2))
+ 
+
+```
+There is virtually no length variation in the targeted fragment of the COI gene. We therefore only keep fragments of the expected length. 
+
+```{r}
+seqtab.nochim_rlen <- seqtab.nochim[, nchar(colnames(seqtab.nochim)) == 313]
+```
+
+###export raw ASV table
+
+```{r}
+seqtab.nochim_rlen %>% 
+  as.data.frame %>% 
+  tibble::rownames_to_column(var = "Sample") %>% 
+  write_tsv(., here("Data", "COI_ASV_redo.text"))
+```
+
+###check Plate Blanks
+
+We have 1 well on the plate with only Milli-Q water that has been left blank on the plate but processed as all other samples during all lab-work. The contaminations in this well is plate-specific.
+
+Number of reads in Blank samples
+```{r}
+seq_tab_blank <- seqtab.nochim_rlen[grepl("BLANK", rownames(seqtab.nochim_rlen)),]
+
+sum(seq_tab_blank)
+
+```
+there is no contamination in the blank
+
+
+export ASVs to Fasta file 
+
+```{r}
+seqs <- DNAStringSet(colnames(seqtab.nochim_rlen))
+
+names(seqs) <- paste("seq", 
+                             formatC(1:length(seqs), flag = "0",
+                                     width = nchar(length(seqs))),
+                             sep = "_")
+
+writeXStringSet(seqs, here("Data", "COI_ASVs_redo.fasta"), format = "fasta")
+```
+
+From here on we merge the ASV tables with the ASV table from the first two runs and analyse together. See the script COI_Seq_analysis.Rmd
+
+
+

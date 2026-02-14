@@ -1,0 +1,262 @@
+---
+title: "DNA Concentrations"
+output: html_notebook
+---
+
+Script to calculate the DNA concentrations for the air - DNA Samples measured in Lund
+
+I measure the DNA Conc. on a Plate-reader (Spark) using the ddDNA_QubitAssay_384. 
+
+I used 4µl DNA for 46µl Mastermix (2µl for standard  curves) --> DNA C need to be divided by 2!
+
+I transferred the DNA from the plates with the 8-channel pipette so Plate1 starts at A1 and Plate 2 at A2. 
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(broom)
+library(ggplot2)
+library(ggrepel)
+library(readr)
+library(googlesheets4)
+library(here)
+library(readxl)
+library(lubridate)
+```
+
+#read in data
+```{r}
+DNAC <- read_excel(here("Data", "p814_Fabian_dsDNA-QubitAssay_384 (Modified)_20220203_120755.xlsx"),
+                   range = "A45:Y61") %>% 
+  select(c(1:13, 24,25))
+
+Plate1 <- read_excel(here("Data", "201020-4-16S_Tail.xlsx"),
+                   range = "A2:M10",
+                   .name_repair = "minimal")
+
+colnames(Plate1)[1] <- "Well"
+
+Plate2 <- read_excel(here("Data", "201020-4-16S_Tail.xlsx"),
+                   range = "A12:M20",
+                   .name_repair = "minimal")
+
+colnames(Plate2)[1] <- "Well"
+```
+
+#Sample metadata
+```{r}
+sample_meta <- read_sheet("https://docs.google.com/spreadsheets/d/1AMpJDHXKzxpfitL9JML8e-8vKTjnSNZT2oq84qmRmuM/edit?usp=sharing", col_types = "c")
+
+sample_meta <- 
+sample_meta %>% 
+  select(Sample_ID, Type, Start_Date, End_Date, Time_h, SizeFrac, Blank, Location, Description) %>% 
+  dplyr::rename(Sample = Sample_ID) %>% 
+  mutate(Start_Date = ymd_hms(Start_Date, truncated = 3)) %>% 
+  mutate(End_Date = ymd_hms(End_Date, truncated = 3)) %>% 
+   mutate(season = case_when(Start_Date < ymd("2020-11-01") ~ "Fall",
+                            TRUE ~ "Spring")) %>% 
+  mutate(Time_h = as.numeric(as.numeric(Time_h))) %>% 
+  mutate(Time_h = case_when(is.na(Time_h) ~ make_difftime(End_Date - Start_Date, units = "h"),
+                            TRUE ~ make_difftime(Time_h*3600, units = "h"))) %>% 
+  bind_rows(tibble(Sample_ID = paste("BLANK", 1:7, sep = ""),
+                   Blank = "Blank"))
+  
+
+sample_meta %>% 
+  filter(season == "Fall") %>% 
+  filter(Type == "HighVol") 
+
+```
+
+
+#Analyse Standard
+
+```{r}
+Standard <- 
+  tibble(OD = unlist(c(DNAC[1:16,15], DNAC[seq(1,16,2),14]))) %>% 
+  mutate(DNA_C = c(rep(c(0,0.1,0.3,0.5,1,3,5,10), each = 2),
+                   c(0,0.1,0.3,0.5,1,3,5,10)),
+         rep = c(rep(c(1,2),8), rep(3,8))) 
+
+lin_mod <- 
+lm(DNA_C ~ 0+ OD, data = Standard) 
+
+nls_mod <- 
+  nls(DNA_C~a + b*OD + c*OD^2,
+      start=list(a=1,b=1,c=1),
+      data = Standard)
+
+ST_pred <- 
+  tibble(OD = seq(0,55000,100)) %>% 
+  mutate(lin = predict(lin_mod, newdata = .)) %>% 
+  mutate(quadratic = predict(nls_mod, newdata = .)) 
+
+Standard %>% 
+  mutate(quadratic = predict(nls_mod, newdata = .)) %>% 
+  ggplot(aes(y = DNA_C, x = OD, colour = as.factor(rep)))+
+  geom_point()+
+  geom_line(data = ST_pred, aes(x = OD, y = lin), colour = "blue", size = 0.5)+
+  geom_line(data = ST_pred, aes(x = OD, y = quadratic), colour = "red", size = 0.5)+
+  theme_bw()
+```
+
+#Plate to OD plate
+```{r}
+Plate1 <- 
+Plate1 %>% 
+  pivot_longer(-1, values_to = "Sample") %>% 
+  mutate(Well = paste(Well, name, sep = "_")) %>% 
+  select(-name) %>% 
+  mutate(ODWell = paste(rep(LETTERS[seq(1,16,2)], each = 12), c(1:12), sep = "_"))
+
+Plate2 <- 
+Plate2 %>% 
+  pivot_longer(-1, values_to = "Sample") %>% 
+  mutate(Well = paste(Well, name, sep = "_")) %>% 
+  select(-name) %>% 
+  mutate(ODWell = paste(rep(LETTERS[seq(2,16,2)], each = 12), c(1:12), sep = "_"))
+
+Plates <- bind_rows(list(Plate1, Plate2),.id = "Plate")
+
+```
+
+#calculate DNAC
+```{r}
+
+DNA_conc <- 
+DNAC %>% 
+  select(1:13) %>% 
+  mutate(`11` = as.numeric(`11`)) %>% 
+  pivot_longer(-1, values_to = "OD") %>% 
+  mutate(ODWell = paste(`<>`, name, sep = "_")) %>% 
+  select(4,3) %>%
+  left_join(Plates) %>% 
+  mutate(DNA_C = predict(nls_mod, newdata = .)) %>% 
+  mutate(DNA_C = DNA_C/2)
+
+write_tsv(DNA_conc, here("Data", "DNA_concentration_HS.txt"))
+
+```
+
+#NGI
+
+Marple VA, Roberts DL, Romay FJ, Miller NC, Truman KG, Van Oort M, Olsson B, Holroyd MJ, Mitchell JP, Hochrainer D. 2003 Next Generation Pharmaceutical Impactor (A New Impactor for Pharmaceutical Inhaler Testing). Part I: Design. Journal of Aerosol Medicine 16, 283–299. (doi:10.1089/089426803769017659)
+
+The NGI impactor has the follwoing D50 particle sizes per stage at the reference flow rate of 60 L/min
+
+Stage 1: 8.06
+Stage 2: 4.46
+Stage 3: 2.82
+Stage 4: 1.66
+Stage 5: 0.94
+Stage 6: 0.55
+Stage 7: 0.34
+Micor-orifice-collector (Stage 8): <0.34
+
+Because of the long tubing, realized air flow was somewhat lower than the reference air flow (measured at 48.5 and 50.6 L / min respectively)
+
+Following 
+
+Mitchell J, Nagel M. 2004 Particle Size Analysis of Aerosols from Medicinal Inhalers. KONA Powder and Particle Journal 22, 32–65. (doi:10.14356/kona.2004010)
+
+we can recalculate the cut-off points for the realized flow rate of ~50 L/min using the following formula:
+
+D50 = D50ref * (Qref / Q)^0.5
+
+Where Q is the air flow and D50 the average particle size captured by a given Stage and ref the reference values for both at the reference air flow. 
+
+```{r}
+D50_adjust <- function(Q, Qref, D50ref){
+  D50 = D50ref * (Qref / Q)^0.5
+  return(D50)
+}
+
+D50ref <- c(8.06,4.46,2.82,1.66,0.94,0.55,0.34)
+Qref <- 60
+Q <- 50
+
+D50_realized <- 
+D50_adjust(Q = Q,
+           Qref = Qref,
+           D50ref = D50ref) %>% 
+  round(2)
+
+D50_realized
+```
+
+
+We eluted the DNA in 100µl (check!) and sampled for 72h at 50L x min^-1. Each sample corresponds thus to 72 x 60 x 50 = 216 000 Liters
+
+
+```{r}
+
+Blanks <- 
+  DNA_conc %>% 
+  left_join(sample_meta) %>% 
+  filter(Sample == "BLANK")
+
+
+NGI_plot <- 
+DNA_conc %>% 
+  left_join(sample_meta) %>% 
+  filter(!is.na(SizeFrac)) %>% 
+  filter(Type == "NGI") %>% 
+  mutate(DNA_L = (DNA_C*100) / 216000 * 1000) %>% #yield per L in ng
+  arrange(desc(SizeFrac)) %>% 
+  mutate(SizeFrac = case_when(SizeFrac == 1 ~ "8.83",
+                               SizeFrac == 2 ~ "4.89",
+                               SizeFrac == 3 ~ "3.09",
+                               SizeFrac == 4 ~ "1.82",
+                               SizeFrac == 5 ~ "1.03",
+                               SizeFrac == 6 ~ "0.60",
+                               SizeFrac == 7 ~ "0.37",
+                               SizeFrac == 8 ~ "< 0.37")) %>% 
+  mutate(SizeFrac = factor(SizeFrac, levels = unique(.$SizeFrac))) %>% 
+  ggplot(aes(x = as.factor(SizeFrac), y = DNA_L, colour = season))+
+  geom_point(alpha = 0.3)+
+  geom_line(aes(group = factor(Start_Date)), alpha = 0.3)+
+  geom_smooth(se = F, aes(group = season))+
+  facet_wrap(~season, ncol = 1)+
+#  geom_hline(data = DNA_conc %>% filter(Sample == "BLANK"), aes(yintercept = DNA_C), colour = "grey", alpha = 0.3)+
+  scale_color_manual(values = c("#9a031e", "#A4CA4E"))+
+  theme_bw(base_size = 15)+
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  labs(x = expression(D[50]~aeorodynamic~diameter~{"(in µm)"}), 
+       y = "DNA yield per Liter air (in ng)")
+
+#ggsave(here("Figures", "DNA_yield_per_L.pdf"), width = 4, height = 6)
+#ggsave(here("Figures", "DNA_yield_per_L.jpg"), width = 4, height = 6)
+
+NGI_plot
+
+
+
+
+```
+
+
+# re-do samples
+
+samples that have been re-sequenced because they failed the first time
+```{r}
+
+Samples_redo <- c("S01","S02","S07","S09","S23","S24","S25",
+                  "S27","S28","S29","S30","S31","S32","S35",
+                  "S36","S37","S38","S39","S52","S54","S72",
+                  "S75","S76","S78","S79","S80","S81","HV03",
+                  "HV04","HV10","HV11")
+
+DNA_conc %>% 
+  mutate(failed = case_when(Sample %in% Samples_redo ~ "failed",
+                            TRUE ~ "worked")) %>% 
+  ggplot(aes(x = Sample, y = DNA_C))+
+  geom_point(alpha = 0.5, aes( colour = failed))+
+  scale_colour_manual(values = c("darkred", "lightgrey"))+
+  theme_minimal()+
+  theme(axis.text.x = element_blank())
+  
+
+```
+
+

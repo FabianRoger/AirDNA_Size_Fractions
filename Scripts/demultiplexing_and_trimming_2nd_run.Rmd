@@ -1,0 +1,235 @@
+---
+title: "demultiplexing and trimmming"
+author: "Fabian Roger"
+date: "11/4/2021"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(jsonlite)
+library(Biostrings)
+library(here)
+library(readxl)
+library(ggplot2)
+```
+
+# demultiplexing by index
+
+I use the [pheniqs](https://biosails.github.io/pheniqs/) software for demultiplexing. 
+
+> Galanti L, Shasha D, Gunsalus KC. 2021 Pheniqs 2.0: accurate, high-performance Bayesian decoding and confidence estimation for combinatorial barcode indexing. BMC Bioinformatics 22, 359. (doi:10.1186/s12859-021-04267-5)
+
+It uses Phred adjusted maximum likelihood decoding
+> A maximum likelihood decoder that directly estimates the decoding error probability from the base calling error probabilities provided by the sequencing platform. Abbreviated PAMLD.
+
+We need to provide it with a configuration file that links the samples to the dual unique indices. 
+
+We split the sample onto two sequencing runs, Plate 1 and Plate 2. The indexing-sheet for plate 1 is the following:
+
+```{r}
+
+IndexPlate <- 
+  read_csv(here("Data", "order_1.csv")) %>% 
+  select(`Sequence Name`,Sequence) %>% 
+  dplyr::rename(Sequence_Name = `Sequence Name`) %>% 
+  filter(grepl("P5_\\d\\d|P7_\\d\\d",Sequence_Name)) %>% 
+  mutate(Sequence = gsub(" ", "", Sequence)) %>% 
+  mutate(Sequence = gsub("AATGATACGGCGACCACCGAGATCTACAC", "", Sequence)) %>%
+  mutate(Sequence = gsub("ACACTCTTTCCCTACACGACGCT", "", Sequence)) %>% 
+  mutate(Sequence = gsub("CAAGCAGAAGACGGCATACGAGAT", "", Sequence)) %>% 
+  mutate(Sequence = gsub("GTGACTGGAGTTCAGACGTGTGCT", "", Sequence)) %>% 
+  mutate(Index = gsub("P\\d_(\\d\\d)", "\\1", Sequence_Name)) %>% 
+  mutate(Sequence_Name = gsub("(P\\d)_\\d\\d", "\\1", Sequence_Name)) %>% 
+  pivot_wider(names_from = Sequence_Name, values_from = Sequence) %>% 
+  mutate(Well_position = paste(rep(LETTERS[1:8], each = 12), formatC(1:12, flag = 0, width = 2), sep = "_")) %>% 
+  mutate(RC_p7 = as.character(reverseComplement(DNAStringSet(.$P7)))) 
+
+```
+
+
+```{r}
+
+Sample_meta <- 
+  read_excel(here("Data", "20220909_Brandt.xlsx"), sheet = "Sorted") %>% 
+  select(1:8) %>% 
+  mutate(Well_position = paste(P_row, formatC(P_col, width = 2, flag = 0), sep = "_")) %>%
+  left_join(IndexPlate) %>% 
+  filter(!is.na(Sample)) %>% 
+  dplyr::rename(Sample_name = Sample) %>% 
+  dplyr::rename(p5_index_sequence_5_3 = `P5`) %>% 
+  mutate(Sample_name = gsub("\\(-\\)", "neg", Sample_name)) %>% 
+  mutate(Sample_name = gsub(" ", "_", Sample_name)) 
+  
+
+write_tsv(Sample_meta, here("Data", "Meta_reseq.txt"))
+  
+```
+
+
+## configuration file 
+
+phenix takes a json formatted configuration file. An example is given [here](https://github.com/biosails/pheniqs/blob/master/example/illumina_vignette/H7LT2DSXX_l01_sample_static.json) which we take as basis for modification 
+
+```{r}
+phenix_config <- read_json(here("Data", "Sequencing_Data", "211022_M01072_0340_000000000-JR6BP", "phenix_config_file.json"))
+
+run_name <- "220912_M06272_0096_000000000-KKGP7"
+```
+
+The metadata contain the index sequences linking the unique dual indices to the samples. 
+
+The P7 index is read in reverseComplement orientation.
+
+## base configurations
+
+Here we give the 
+
++ input directory (where the files are) 
++ output directory (where the files should be written to) 
++ the 4 filenames (reads (R) and indices (I) for forward and reverse) 
++ and the filename of the sample report
+
+note that \$output will be ignored if we write the reads to demultiplexed fastq files
+
+```{r}
+
+
+
+phenix_config$PM <- run_name
+
+phenix_config$`base input url` <- here("Data", "Sequencing_Data", run_name)
+
+phenix_config$`base output url` <- here("Data", "Sequencing_Data", run_name, "demultiplexed")
+
+#create directory if it doesn't exist
+if(!dir.exists(here("Data", "Sequencing_Data", run_name, "demultiplexed"))){
+  dir.create(here("Data","Sequencing_Data", run_name, "demultiplexed"))
+}
+
+phenix_config$`flowcell id` <- "unkown"
+
+#forward reads
+phenix_config$input[[1]] <- "Undetermined_S0_L001_R1_001.fastq.gz"
+
+#forward index
+phenix_config$input[[2]] <- "Undetermined_S0_L001_I1_001.fastq.gz"
+
+#reverse index
+phenix_config$input[[3]] <- "Undetermined_S0_L001_I2_001.fastq.gz"
+
+#reverse reads
+phenix_config$input[[4]] <- "Undetermined_S0_L001_R2_001.fastq.gz"
+
+#output
+phenix_config$output[[1]] <- "Undetermined_S0_L001.bam"
+
+#report
+phenix_config$`report url` <- paste("sample_report_", run_name, ".json", sep="")
+
+```
+
+## barcodes
+
+Here we format the core of the configuration file, associating each sample with the unique barcode configuration.
+
+Sample_meta is a dataframe containing the sample names, the P5 barcode, the P7 barcode and the reverseComplement of the P7 barcode
+
+We used the P5 universal tail on the forward primer and the P7 universal tail on the reverse primer. The index on the first read (P7) is in reverse complement.
+
+```{r}
+#subset to number of sample (max 94 in template)
+my_config <- 
+phenix_config$sample$codec[1:nrow(Sample_meta)]
+
+#add sample names
+names(my_config) <- paste("@", Sample_meta$Sample_name, sep ="")
+
+#define barcode combination for each sample
+for(i in names(my_config)){
+  
+  #extarct sample name
+  sample <- gsub("@", "", i)
+  
+  #add sample name
+  my_config[[i]]$LB <- sample
+  
+  #give barcode for first read 
+  my_config[[i]]$barcode[[1]] <- Sample_meta[Sample_meta$Sample_name == sample,]$RC_p7
+  
+  #give barcode for second read 
+  my_config[[i]]$barcode[[2]] <- Sample_meta[Sample_meta$Sample_name == sample,]$p5_index_sequence_5_3
+    
+  
+  #define output file for R1 reads
+  my_config[[i]]$output[[1]] <- paste(sample, "_R1.fastq.gz", sep ="")
+  
+  #define output file for R2 reads
+  my_config[[i]]$output[[2]] <- paste(sample, "_R2.fastq.gz", sep ="")
+  
+}
+
+#replace edited configuration in template file
+phenix_config$sample$codec <- my_config
+
+#define output for reads with no recognizable barcodes
+phenix_config$sample$undetermined$output[[1]] <- "unclear_barcode_R1.fastq.gz"
+phenix_config$sample$undetermined$output[[2]] <- "unclear_barcode_R2.fastq.gz"
+```
+
+## Save configuration file
+
+```{r}
+path_to_file <- here("Data","Sequencing_Data", run_name, "phenix_config_plate1.json")
+write_json(phenix_config, path_to_file, pretty = T, auto_unbox = TRUE)
+```
+
+## run pheniqs
+
+```{r}
+system(paste("/Users/fabian/pheniqs_head_static/bin/static-HEAD/install/bin/pheniqs mux --config ",path_to_file, sep = ""))
+```
+
+## check report
+
+```{r}
+report <- read_json(here("Data", "Sequencing_Data", run_name, "demultiplexed", paste("sample_report_", run_name, ".json", sep = "")))
+```
+
+total number of reads
+
+```{r}
+report$outgoing$count
+```
+
+fraction of reads with valid indices
+
+```{r}
+report$outgoing$`pf fraction`
+```
+
+```{r}
+dm_stat <- 
+report$sample$classified %>% 
+  lapply(., as.data.frame) %>% 
+  bind_rows() %>% 
+  select(LB, BC, count) %>% 
+  mutate(prct = signif(count/sum(count)*100, 2)) 
+
+Sample_meta %>% 
+  select(Sample_name, Primer, Author) %>% 
+  mutate(Sample_type = case_when(grepl("BLANK|neg", Sample_name) ~ "control",
+                                 TRUE ~ "sample")) %>% 
+  left_join(.,dm_stat, by = c("Sample_name" = "LB")) %>% 
+  dplyr::relocate(count,prct, .before = Sample_type) %>% 
+  arrange(desc(count)) %>% 
+  mutate(rank = 1:n()) %>% 
+  ggplot(aes(x = rank, y = count, colour = Sample_type))+
+  facet_grid(Primer~Author)+
+  geom_point()+
+  scale_y_log10()
+    
+  
+```
