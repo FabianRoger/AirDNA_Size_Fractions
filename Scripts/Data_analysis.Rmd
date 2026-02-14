@@ -1,20 +1,15 @@
 ---
-title: "Airborne eDNA size-fraction analysis"
+title: "Airborne eDNA Size-Fraction Analysis"
 output: html_notebook
 ---
 
-This notebook is written as a one-time ecological analysis script with clear, readable steps.
+This notebook documents the full analysis workflow used for the size-fraction airborne eDNA manuscript. The workflow starts from processed sequencing and metadata tables and produces the statistical outputs and figures used to interpret biological patterns across aerosol size classes and seasons.
 
-The workflow is:
+The analysis is organized as a linear manuscript workflow: data import, metadata harmonization, contaminant removal, diversity and composition analyses, integration with optical bioaerosol monitoring, and environmental context analyses.
 
-1. load all required data at the top,
-2. prepare metadata and clean the ASV table,
-3. run manuscript analyses,
-4. write intermediate tables and final figures to file.
+## 1) Analysis setup
 
-## 1) Setup
-
-We load the packages used in this notebook and set a few global options.
+This section loads the packages used throughout the manuscript and prepares output folders for tables and figures. All derived outputs are written to disk so the full workflow remains inspectable and reproducible for reviewers.
 
 ```{r setup, message=FALSE, warning=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
@@ -23,7 +18,6 @@ library(tidyverse)
 library(here)
 library(readxl)
 library(lubridate)
-library(googlesheets4)
 library(vegan)
 library(iNEXT)
 library(fuzzyjoin)
@@ -33,122 +27,67 @@ library(car)
 library(suncalc)
 
 theme_set(theme_bw(base_size = 11))
-```
 
-## 2) Paths and output folders
-
-We define all main paths once, then reuse them.
-
-```{r paths}
-data_dir <- here("Data")
 fig_dir <- here("Figures", "data_analysis_clean")
 derived_dir <- here("Data", "derived")
 
 dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(derived_dir, recursive = TRUE, showWarnings = FALSE)
-
-path_asv <- here("Data", "COI_ASW_glom.txt")
-path_tax <- here("Data", "COI_taxa_80_glom.txt")
-path_prob <- here("Data", "COI_Sintax_prob.txt")
-path_dna <- here("Data", "DNA_concentration_HS.txt")
-path_diversity_output <- here("Data", "derived", "diversity_estimates_iNEXT.tsv")
-path_matched <- here("Data", "Matched_DNA_Biotrack.txt")
-path_sample_meta_local <- here("Data", "sample_meta.tsv")
-
-path_biotrack_fall_1 <- here("Data", "Hyltemossa_20201006.xlsx")
-path_biotrack_fall_2 <- here("Data", "Hyltemossa_20201022.xlsx")
-path_biotrack_spring_1 <- here("Data", "Hyltemossa_20210428.xlsx")
-path_biotrack_spring_2 <- here("Data", "Hyltemossa_20210524.xlsx")
-
-path_weather_30m <- here("Data", "ICOS", "My data cart", "ICOS_ATC_NRT_HTM_2021-02-01_2022-02-28_30.0_612.MTO")
-path_precip <- here("Data", "ICOS", "SE-Htm_meteo_2020_CP_flag.txt")
-path_deposition <- here("Data", "deposition_speed.txt")
-
-required_input_files <- c(
-  path_asv, path_tax, path_prob, path_dna,
-  path_biotrack_fall_1, path_biotrack_fall_2,
-  path_biotrack_spring_1, path_biotrack_spring_2,
-  path_weather_30m, path_precip, path_deposition
-)
-
-missing_input_files <- required_input_files[!file.exists(required_input_files)]
-if (length(missing_input_files) > 0) {
-  stop(
-    "Missing required input files:\n",
-    paste(missing_input_files, collapse = "\n")
-  )
-}
 ```
 
-## 3) Load all raw data
+## 2) Load manuscript input data
 
-All raw inputs are read in this section so data dependencies are explicit.
+The notebook reads the core processed input data tables directly from the repository. These include the ASV abundance matrix, taxonomic assignments and assignment confidence, sample metadata, DNA concentration measurements, Biotrack optical particle measurements, meteorological observations, and deposition-speed input values.
 
-```{r load-data, message=TRUE}
-# Core metabarcoding tables
-asv_table_raw <- read_tsv(path_asv, show_col_types = FALSE)
-taxonomy_table_raw <- read_tsv(path_tax, show_col_types = FALSE)
-taxonomy_probabilities <- read_tsv(path_prob, show_col_types = FALSE)
-dna_concentration <- read_tsv(path_dna, show_col_types = FALSE)
+```{r load-data}
+asv_table_raw <- read_tsv(here("Data", "COI_ASW_glom.txt"), show_col_types = FALSE)
+taxonomy_table_raw <- read_tsv(here("Data", "COI_taxa_80_glom.txt"), show_col_types = FALSE)
+taxonomy_probabilities <- read_tsv(here("Data", "COI_Sintax_prob.txt"), show_col_types = FALSE)
+sample_metadata_raw <- read_tsv(here("Data", "sample_meta.tsv"), show_col_types = FALSE)
+dna_concentration <- read_tsv(here("Data", "DNA_concentration_HS.txt"), show_col_types = FALSE)
 
-# Metadata: local file by default, optional refresh from Google Sheet
-sample_meta_url <- "https://docs.google.com/spreadsheets/d/1AMpJDHXKzxpfitL9JML8e-8vKTjnSNZT2oq84qmRmuM/edit?usp=sharing"
-refresh_sample_meta <- tolower(Sys.getenv("REFRESH_SAMPLE_META", "false")) == "true"
+biotrack_20201006 <- read_excel(here("Data", "Hyltemossa_20201006.xlsx"))
+biotrack_20201022 <- read_excel(here("Data", "Hyltemossa_20201022.xlsx"))
+biotrack_20210428 <- read_excel(here("Data", "Hyltemossa_20210428.xlsx"))
+biotrack_20210524 <- read_excel(here("Data", "Hyltemossa_20210524.xlsx"))
 
-if (refresh_sample_meta || !file.exists(path_sample_meta_local)) {
-  gs4_deauth()
-  sample_meta_raw <- read_sheet(sample_meta_url, col_types = "c")
-  write_tsv(sample_meta_raw, path_sample_meta_local)
-} else {
-  sample_meta_raw <- read_tsv(path_sample_meta_local, show_col_types = FALSE)
-}
+weather_30m_raw <- read_delim(
+  here("Data", "ICOS", "My data cart", "ICOS_ATC_NRT_HTM_2021-02-01_2022-02-28_30.0_612.MTO"),
+  delim = ";",
+  skip = 38,
+  show_col_types = FALSE
+)
 
-# Biotrack campaign files
-biotrack_fall_1_raw <- read_excel(path_biotrack_fall_1)
-biotrack_fall_2_raw <- read_excel(path_biotrack_fall_2)
-biotrack_spring_1_raw <- read_excel(path_biotrack_spring_1)
-biotrack_spring_2_raw <- read_excel(path_biotrack_spring_2)
+precip_raw <- read_delim(
+  here("Data", "ICOS", "SE-Htm_meteo_2020_CP_flag.txt"),
+  delim = ",",
+  show_col_types = FALSE
+)
 
-# Weather and deposition inputs
-weather_30m_raw <- read_delim(path_weather_30m, delim = ";", skip = 38, show_col_types = FALSE)
-precip_raw <- read_delim(path_precip, delim = ",", show_col_types = FALSE)
-deposition_raw <- read_tsv(path_deposition, show_col_types = FALSE)
-
-# Optional precomputed table
-matched_dna_biotrack_existing <- if (file.exists(path_matched)) {
-  read_tsv(path_matched, show_col_types = FALSE)
-} else {
-  NULL
-}
+deposition_raw <- read_tsv(here("Data", "deposition_speed.txt"), show_col_types = FALSE)
 
 tibble(
-  object = c("asv_table_raw", "taxonomy_table_raw", "taxonomy_probabilities", "sample_meta_raw", "dna_concentration"),
-  rows = c(nrow(asv_table_raw), nrow(taxonomy_table_raw), nrow(taxonomy_probabilities), nrow(sample_meta_raw), nrow(dna_concentration)),
-  cols = c(ncol(asv_table_raw), ncol(taxonomy_table_raw), ncol(taxonomy_probabilities), ncol(sample_meta_raw), ncol(dna_concentration))
+  table = c(
+    "asv_table_raw", "taxonomy_table_raw", "taxonomy_probabilities",
+    "sample_metadata_raw", "dna_concentration", "weather_30m_raw"
+  ),
+  rows = c(
+    nrow(asv_table_raw), nrow(taxonomy_table_raw), nrow(taxonomy_probabilities),
+    nrow(sample_metadata_raw), nrow(dna_concentration), nrow(weather_30m_raw)
+  ),
+  cols = c(
+    ncol(asv_table_raw), ncol(taxonomy_table_raw), ncol(taxonomy_probabilities),
+    ncol(sample_metadata_raw), ncol(dna_concentration), ncol(weather_30m_raw)
+  )
 )
 ```
 
-## 4) Prepare sample metadata
+## 3) Prepare sample metadata for ecological comparisons
 
-We standardize metadata columns, parse dates, define season, and map size-fraction labels.
+Sample metadata are harmonized into an analysis-ready table with parsed start/end times, season assignment, and mapped NGI size-fraction labels in aerodynamic diameter classes. This table provides the primary design structure for downstream comparisons across size fractions and between fall and spring campaigns.
 
-```{r prepare-metadata}
-required_meta_cols <- c(
-  "Sample_ID", "Type", "Start_Date", "End_Date", "Time_h",
-  "SizeFrac", "Blank", "Location", "Description"
-)
-
-if (!"Sample_ID" %in% names(sample_meta_raw) && "Sample" %in% names(sample_meta_raw)) {
-  sample_meta_raw <- sample_meta_raw %>% rename(Sample_ID = Sample)
-}
-
-missing_cols <- setdiff(required_meta_cols, names(sample_meta_raw))
-if (length(missing_cols) > 0) {
-  for (nm in missing_cols) sample_meta_raw[[nm]] <- NA_character_
-}
-
-sample_metadata <- sample_meta_raw %>%
-  select(all_of(required_meta_cols)) %>%
+```{r metadata-prep}
+sample_metadata <- sample_metadata_raw %>%
   rename(Sample = Sample_ID) %>%
   mutate(
     Start_Date = ymd_hms(Start_Date, truncated = 3),
@@ -159,10 +98,13 @@ sample_metadata <- sample_meta_raw %>%
     ),
     Time_h = as.numeric(Time_h),
     Time_h = case_when(
-      is.na(Time_h) & !is.na(Start_Date) & !is.na(End_Date) ~ as.numeric(difftime(End_Date, Start_Date, units = "hours")),
+      is.na(Time_h) ~ as.numeric(difftime(End_Date, Start_Date, units = "hours")),
       TRUE ~ Time_h
     ),
-    Type = case_when(is.na(Blank) ~ Type, TRUE ~ Blank),
+    Type = case_when(
+      is.na(Blank) ~ Type,
+      TRUE ~ Blank
+    ),
     SizeFrac = as.character(SizeFrac),
     SizeFrac = recode(
       SizeFrac,
@@ -185,11 +127,11 @@ sample_metadata %>%
   count(Type, season, SizeFrac, sort = TRUE)
 ```
 
-## 5) Initial sample-level checks
+## 4) Sequencing depth and DNA concentration context
 
-These quick checks help confirm sequencing depth and how it relates to DNA concentration.
+Before ecological inference, sequencing depth is summarized per sample and compared with DNA concentration measurements. These checks provide context on data yield across sample types and identify whether richness patterns could be strongly driven by extraction yield rather than aerosol size structure.
 
-```{r sample-summary}
+```{r read-summary}
 sample_read_summary <- asv_table_raw %>%
   pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>%
   group_by(Sample) %>%
@@ -203,7 +145,7 @@ sample_read_summary <- asv_table_raw %>%
 
 write_tsv(sample_read_summary, here(derived_dir, "sample_read_summary.tsv"))
 
-sample_read_summary %>%
+plot_reads_rank <- sample_read_summary %>%
   arrange(desc(total_reads)) %>%
   mutate(rank = row_number()) %>%
   ggplot(aes(rank, total_reads, colour = Type)) +
@@ -211,8 +153,11 @@ sample_read_summary %>%
   scale_y_log10() +
   facet_wrap(~Type)
 
+plot_reads_rank
+
 ggsave(
   filename = here(fig_dir, "qc_reads_by_sample_rank.png"),
+  plot = plot_reads_rank,
   width = 7,
   height = 4,
   dpi = 300
@@ -220,7 +165,7 @@ ggsave(
 ```
 
 ```{r dna-vs-reads}
-sample_read_summary %>%
+plot_dna_reads <- sample_read_summary %>%
   filter(!is.na(DNA_C)) %>%
   ggplot(aes(DNA_C, total_reads + 1, colour = season)) +
   geom_point() +
@@ -229,17 +174,20 @@ sample_read_summary %>%
   geom_hline(yintercept = 2e4, linetype = "dashed") +
   labs(x = "DNA concentration", y = "Reads")
 
+plot_dna_reads
+
 ggsave(
   filename = here(fig_dir, "qc_dna_vs_reads.png"),
+  plot = plot_dna_reads,
   width = 7,
   height = 4,
   dpi = 300
 )
 ```
 
-## 6) Remove contaminants (human and blanks)
+## 5) Remove known contaminants before ecological analyses
 
-We remove sequences identified as human or present in blank controls.
+Human-assigned sequences and sequences detected in extraction/process blanks are removed before ecological analyses. This filtering step focuses inference on environmental airborne eDNA rather than laboratory-derived or human-source contamination.
 
 ```{r remove-contaminants}
 extraction_blank_sequences <- asv_table_raw %>%
@@ -276,9 +224,9 @@ tibble(
 )
 ```
 
-## 7) Taxonomic composition by size fraction
+## 6) Taxonomic composition across NGI size fractions
 
-We summarize OTUs by rank and produce manuscript-style phylum composition plots.
+Taxonomic composition is summarized across ranks for NGI samples and used to produce phylum-level composition figures for major airborne groups. The phylum plot focuses on Ascomycota, Basidiomycota, and Arthropoda because these groups represent dominant biological signals for manuscript interpretation.
 
 ```{r taxa-distribution}
 ngi_taxa_distribution <- asv_table_clean %>%
@@ -327,7 +275,7 @@ phylum_label_df <- ngi_phylum_relative %>%
 
 write_tsv(ngi_phylum_relative, here(derived_dir, "ngi_relative_phylum_abundance.tsv"))
 
-ngi_phylum_relative %>%
+plot_phylum <- ngi_phylum_relative %>%
   ggplot(aes(SizeFrac, relative_otu, fill = taxa)) +
   geom_col() +
   geom_text(
@@ -345,13 +293,15 @@ ngi_phylum_relative %>%
   ) +
   theme(legend.position = "bottom")
 
-ggsave(here(fig_dir, "figure_relative_phylum_abundance.png"), width = 8, height = 4, dpi = 300)
-ggsave(here(fig_dir, "figure_relative_phylum_abundance.pdf"), width = 8, height = 4)
+plot_phylum
+
+ggsave(here(fig_dir, "figure_relative_phylum_abundance.png"), plot = plot_phylum, width = 8, height = 4, dpi = 300)
+ggsave(here(fig_dir, "figure_relative_phylum_abundance.pdf"), plot = plot_phylum, width = 8, height = 4)
 ```
 
-## 8) Rarefaction curves
+## 7) Rarefaction and coverage-based richness estimates
 
-We compute rarefaction curves for major phyla and save the tidy output.
+Rarefaction curves are used to visualize richness accumulation with sequencing depth for major phyla. Coverage-based iNEXT estimates are then used for standardized richness comparisons across seasons and size fractions, reducing bias from uneven read counts.
 
 ```{r rarefaction}
 main_phyla <- c("Arthropoda", "Ascomycota", "Basidiomycota", "Chordata")
@@ -384,7 +334,7 @@ rarefaction_df <- bind_rows(rarefaction_list) %>%
 
 write_tsv(rarefaction_df, here(derived_dir, "rarefaction_curves.tsv"))
 
-rarefaction_df %>%
+plot_rarefaction <- rarefaction_df %>%
   left_join(sample_metadata, by = "Sample") %>%
   filter(Type == "NGI") %>%
   ggplot(aes(size, Species, group = Sample, colour = season)) +
@@ -395,12 +345,10 @@ rarefaction_df %>%
   labs(x = "Reads", y = "OTUs") +
   theme(legend.position = "bottom")
 
-ggsave(here(fig_dir, "figure_rarefaction_curves.png"), width = 8, height = 5, dpi = 300)
+plot_rarefaction
+
+ggsave(here(fig_dir, "figure_rarefaction_curves.png"), plot = plot_rarefaction, width = 8, height = 5, dpi = 300)
 ```
-
-## 9) Coverage-based richness estimates (iNEXT)
-
-This is one of the slower steps, so this chunk is cached.
 
 ```{r diversity-estimates, cache=TRUE}
 diversity_estimate_list <- list()
@@ -431,10 +379,12 @@ for (phylum_name in main_phyla) {
 
 diversity_estimates <- bind_rows(diversity_estimate_list)
 
-write_tsv(diversity_estimates, path_diversity_output)
+write_tsv(diversity_estimates, here(derived_dir, "diversity_estimates_iNEXT.tsv"))
 ```
 
-We use the diversity table from the previous chunk for plotting and model summaries.
+## 8) Richness trends by size class, season, and DNA concentration
+
+Coverage-standardized richness is analyzed across size fractions and seasons for the target fungal and arthropod phyla. A linear model then quantifies the relative contributions of season, phylum, size fraction, and DNA concentration.
 
 ```{r diversity-plots}
 diversity_plot_data <- diversity_estimates %>%
@@ -442,7 +392,7 @@ diversity_plot_data <- diversity_estimates %>%
   left_join(sample_metadata, by = "Sample") %>%
   filter(Type == "NGI")
 
-diversity_plot <- diversity_plot_data %>%
+plot_richness_size <- diversity_plot_data %>%
   ggplot(aes(SizeFrac, qD, colour = season)) +
   geom_point(alpha = 0.5, size = 1) +
   geom_line(aes(group = Start_Date), alpha = 0.4, linewidth = 0.3) +
@@ -452,11 +402,11 @@ diversity_plot <- diversity_plot_data %>%
   labs(x = "Aerodynamic diameter D50 (um)", y = "OTU richness") +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-diversity_plot
+plot_richness_size
 
-ggsave(here(fig_dir, "figure_richness_by_size_fraction.png"), diversity_plot, width = 6, height = 7, dpi = 300)
+ggsave(here(fig_dir, "figure_richness_by_size_fraction.png"), plot = plot_richness_size, width = 6, height = 7, dpi = 300)
 
-dna_vs_diversity_plot <- diversity_plot_data %>%
+plot_dna_richness <- diversity_plot_data %>%
   left_join(dna_concentration, by = "Sample") %>%
   ggplot(aes(DNA_C, qD, colour = season)) +
   geom_point(alpha = 0.8, size = 0.8) +
@@ -467,9 +417,9 @@ dna_vs_diversity_plot <- diversity_plot_data %>%
   scale_color_manual(values = c("#025196", "#FDB338")) +
   labs(x = "DNA concentration", y = "OTU richness")
 
-dna_vs_diversity_plot
+plot_dna_richness
 
-ggsave(here(fig_dir, "figure_dna_vs_richness.png"), dna_vs_diversity_plot, width = 7, height = 6, dpi = 300)
+ggsave(here(fig_dir, "figure_dna_vs_richness.png"), plot = plot_dna_richness, width = 7, height = 6, dpi = 300)
 ```
 
 ```{r diversity-model}
@@ -486,9 +436,9 @@ write_tsv(diversity_model_anova, here(derived_dir, "diversity_model_anova.tsv"))
 diversity_model_anova
 ```
 
-## 10) NMDS and a simple sequence heatmap
+## 9) Community ordination and dominant sequence patterns
 
-We visualize broad community composition and dominant sequence patterns.
+Community structure is visualized with Bray-Curtis NMDS using NGI samples. A sequence heatmap of dominant ASVs per sample complements the ordination by showing broad abundance-pattern contrasts across size fractions and seasons.
 
 ```{r nmds}
 asv_ngi_matrix <- asv_table_clean %>%
@@ -506,15 +456,15 @@ nmds_points <- as_tibble(ngi_nmds$points, rownames = "Sample") %>%
 
 write_tsv(nmds_points, here(derived_dir, "nmds_points.tsv"))
 
-nmds_plot <- nmds_points %>%
+plot_nmds <- nmds_points %>%
   filter(SizeFrac != "< 0.37") %>%
   ggplot(aes(MDS1, MDS2, colour = SizeFrac)) +
   geom_point() +
   facet_wrap(~season)
 
-nmds_plot
+plot_nmds
 
-ggsave(here(fig_dir, "figure_nmds.png"), nmds_plot, width = 7, height = 4, dpi = 300)
+ggsave(here(fig_dir, "figure_nmds.png"), plot = plot_nmds, width = 7, height = 4, dpi = 300)
 ```
 
 ```{r heatmap-top-seq}
@@ -538,7 +488,7 @@ heatmap_df <- asv_table_clean %>%
 
 write_tsv(heatmap_df, here(derived_dir, "heatmap_top_sequences.tsv"))
 
-heatmap_plot <- heatmap_df %>%
+plot_heatmap <- heatmap_df %>%
   ggplot(aes(Sample, seq, fill = log10(reads + 1))) +
   geom_tile() +
   facet_wrap(season ~ SizeFrac, scales = "free_x", ncol = 8) +
@@ -549,22 +499,21 @@ heatmap_plot <- heatmap_df %>%
     axis.ticks.y = element_blank()
   )
 
-heatmap_plot
+plot_heatmap
 
-ggsave(here(fig_dir, "figure_heatmap_top_sequences.png"), heatmap_plot, width = 12, height = 7, dpi = 300)
+ggsave(here(fig_dir, "figure_heatmap_top_sequences.png"), plot = plot_heatmap, width = 12, height = 7, dpi = 300)
 ```
 
-## 11) Prepare Biotrack time series
+## 10) Process Biotrack optical measurements
 
-We load and combine the four campaign files into one consistent table.
+Biotrack channel data from the four campaigns are merged into a common table and converted to concentrations per liter. The analysis focuses on channels corresponding to approximately 1-14 um particles to align optical size classes with the sequencing size-fraction framework.
 
 ```{r biotrack-prepare}
-biotrack_fall_raw <- bind_rows(biotrack_fall_1_raw, biotrack_fall_2_raw)
-biotrack_spring_raw <- bind_rows(biotrack_spring_1_raw, biotrack_spring_2_raw)
-
 biotrack_combined <- bind_rows(
-  biotrack_fall_raw %>% mutate(season = "Fall"),
-  biotrack_spring_raw %>% mutate(season = "Spring")
+  biotrack_20201006 %>% mutate(season = "Fall"),
+  biotrack_20201022 %>% mutate(season = "Fall"),
+  biotrack_20210428 %>% mutate(season = "Spring"),
+  biotrack_20210524 %>% mutate(season = "Spring")
 ) %>%
   filter(!is.na(Date)) %>%
   select(Date, Time, starts_with("Ch"), FlowStatus, Laser_Status, Vol_L, season) %>%
@@ -626,7 +575,7 @@ biotrack_daynight_blocks <- biotrack_plot_data %>%
   summarise(start = min(Date_Time), end = max(Date_Time), .groups = "drop") %>%
   filter(end > start)
 
-biotrack_time_plot <- biotrack_plot_data %>%
+plot_biotrack_time <- biotrack_plot_data %>%
   ggplot(aes(Date_Time)) +
   geom_rect(
     data = biotrack_daynight_blocks,
@@ -640,48 +589,43 @@ biotrack_time_plot <- biotrack_plot_data %>%
   scale_fill_manual(values = c("day" = "#FDC500", "night" = "#00296B")) +
   labs(y = "Bioaerosol concentration per L", x = NULL, fill = NULL)
 
-biotrack_time_plot
+plot_biotrack_time
 
-ggsave(here(fig_dir, "figure_biotrack_time_series.png"), biotrack_time_plot, width = 10, height = 5, dpi = 300)
+ggsave(here(fig_dir, "figure_biotrack_time_series.png"), plot = plot_biotrack_time, width = 10, height = 5, dpi = 300)
 ```
 
-## 12) Match NGI size fractions with Biotrack classes
+## 11) Link NGI filter classes with Biotrack classes
 
-We use a precomputed match table if present; otherwise we build it from the time windows.
+To relate molecular richness and concentration patterns to optical measurements, NGI sample windows are matched to Biotrack observations over the same sampling intervals. Biotrack channels are then grouped to align with NGI aerodynamic size ranges.
 
 ```{r match-ngi-biotrack}
-if (!is.null(matched_dna_biotrack_existing)) {
-  matched_dna_biotrack <- matched_dna_biotrack_existing
-} else {
-  ngi_biotrack <- sample_metadata %>%
-    filter(Type == "NGI") %>%
-    fuzzy_left_join(
-      biotrack_combined,
-      by = c("Start_Date" = "Date_Time", "End_Date" = "Date_Time"),
-      match_fun = list(`<=`, `>=`)
-    ) %>%
-    group_by(Sample, Size_frac) %>%
-    summarise(bio = sum(bio, na.rm = TRUE), .groups = "drop")
+ngi_biotrack <- sample_metadata %>%
+  filter(Type == "NGI") %>%
+  fuzzy_left_join(
+    biotrack_combined,
+    by = c("Start_Date" = "Date_Time", "End_Date" = "Date_Time"),
+    match_fun = list(`<=`, `>=`)
+  ) %>%
+  group_by(Sample, Size_frac) %>%
+  summarise(bio = sum(bio, na.rm = TRUE), .groups = "drop")
 
-  matched_dna_biotrack <- ngi_biotrack %>%
-    pivot_wider(names_from = Size_frac, values_from = bio) %>%
-    mutate(Ch5_6 = `5-10um` + `10-14um`) %>%
-    select(Sample, `1-3um`, `3-5um`, Ch5_6) %>%
-    pivot_longer(-Sample, names_to = "BT_Size_frac", values_to = "count") %>%
-    left_join(sample_metadata %>% select(Sample, SizeFrac), by = "Sample") %>%
-    mutate(
-      match = case_when(
-        SizeFrac %in% c("8.83", "4.89") & BT_Size_frac == "Ch5_6" ~ TRUE,
-        SizeFrac == "3.09" & BT_Size_frac == "3-5um" ~ TRUE,
-        SizeFrac %in% c("1.82", "1.03") & BT_Size_frac == "1-3um" ~ TRUE,
-        TRUE ~ FALSE
-      )
-    ) %>%
-    filter(match)
+matched_dna_biotrack <- ngi_biotrack %>%
+  pivot_wider(names_from = Size_frac, values_from = bio) %>%
+  mutate(Ch5_6 = `5-10um` + `10-14um`) %>%
+  select(Sample, `1-3um`, `3-5um`, Ch5_6) %>%
+  pivot_longer(-Sample, names_to = "BT_Size_frac", values_to = "count") %>%
+  left_join(sample_metadata %>% select(Sample, SizeFrac), by = "Sample") %>%
+  mutate(
+    match = case_when(
+      SizeFrac %in% c("8.83", "4.89") & BT_Size_frac == "Ch5_6" ~ TRUE,
+      SizeFrac == "3.09" & BT_Size_frac == "3-5um" ~ TRUE,
+      SizeFrac %in% c("1.82", "1.03") & BT_Size_frac == "1-3um" ~ TRUE,
+      TRUE ~ FALSE
+    )
+  ) %>%
+  filter(match)
 
-  write_tsv(matched_dna_biotrack, path_matched)
-}
-
+write_tsv(matched_dna_biotrack, here("Data", "Matched_DNA_Biotrack.txt"))
 write_tsv(matched_dna_biotrack, here(derived_dir, "matched_dna_biotrack.tsv"))
 
 matched_dna_biotrack
@@ -699,7 +643,7 @@ plot_dna_vs_biotrack <- matched_dna_biotrack %>%
 
 plot_dna_vs_biotrack
 
-ggsave(here(fig_dir, "figure_biotrack_vs_dna.png"), plot_dna_vs_biotrack, width = 6, height = 4, dpi = 300)
+ggsave(here(fig_dir, "figure_biotrack_vs_dna.png"), plot = plot_dna_vs_biotrack, width = 6, height = 4, dpi = 300)
 
 plot_richness_vs_biotrack <- matched_dna_biotrack %>%
   left_join(diversity_estimates, by = "Sample") %>%
@@ -715,51 +659,12 @@ plot_richness_vs_biotrack <- matched_dna_biotrack %>%
 
 plot_richness_vs_biotrack
 
-ggsave(here(fig_dir, "figure_biotrack_vs_richness.png"), plot_richness_vs_biotrack, width = 7, height = 6, dpi = 300)
+ggsave(here(fig_dir, "figure_biotrack_vs_richness.png"), plot = plot_richness_vs_biotrack, width = 7, height = 6, dpi = 300)
 ```
 
-## 13) HighVol comparison (if HighVol metadata are available)
+## 12) Weather context and wind-direction structure
 
-This part is optional and only runs if HighVol samples exist in metadata.
-
-```{r highvol-optional}
-if (any(sample_metadata$Type == "HighVol")) {
-  highvol_biotrack <- sample_metadata %>%
-    filter(Type == "HighVol") %>%
-    filter(!str_detect(Sample, "-")) %>%
-    fuzzy_left_join(
-      biotrack_combined,
-      by = c("Start_Date" = "Date_Time", "End_Date" = "Date_Time"),
-      match_fun = list(`<=`, `>=`)
-    ) %>%
-    group_by(Sample, Size_frac) %>%
-    summarise(bio = sum(bio, na.rm = TRUE), all_count = sum(all, na.rm = TRUE), .groups = "drop")
-
-  highvol_match <- highvol_biotrack %>%
-    select(-all_count) %>%
-    pivot_wider(names_from = Size_frac, values_from = bio) %>%
-    mutate(sum_count = `1-3um` + `3-5um` + `5-10um`) %>%
-    select(Sample, sum_count) %>%
-    left_join(sample_metadata, by = "Sample")
-
-  write_tsv(highvol_match, here(derived_dir, "highvol_biotrack_match.tsv"))
-
-  highvol_dna_plot <- highvol_match %>%
-    left_join(dna_concentration, by = "Sample") %>%
-    ggplot(aes(sum_count, DNA_C, colour = season)) +
-    geom_point() +
-    scale_x_log10() +
-    labs(x = "Biotrack summed count", y = "DNA concentration")
-
-  ggsave(here(fig_dir, "figure_highvol_biotrack_vs_dna.png"), highvol_dna_plot, width = 6, height = 4, dpi = 300)
-} else {
-  message("No HighVol samples in current metadata. Skipping HighVol section.")
-}
-```
-
-## 14) Weather summaries
-
-We clean weather inputs and make a simple wind-direction summary plot.
+Meteorological data are cleaned to provide environmental context for the sampling period. A wind-direction summary is included to describe dominant airflow sectors by month, which supports interpretation of temporal shifts in observed airborne biological communities.
 
 ```{r weather-clean}
 weather_30m <- weather_30m_raw %>%
@@ -788,21 +693,21 @@ wind_rose_df <- weather_30m %>%
 
 write_tsv(wind_rose_df, here(derived_dir, "wind_rose_counts.tsv"))
 
-wind_rose_plot <- wind_rose_df %>%
+plot_wind_rose <- wind_rose_df %>%
   ggplot(aes(WD, freq, fill = WS)) +
   geom_col() +
   coord_polar(start = -0.4) +
   scale_fill_viridis_c() +
   facet_wrap(~Month)
 
-wind_rose_plot
+plot_wind_rose
 
-ggsave(here(fig_dir, "figure_wind_rose_by_month.png"), wind_rose_plot, width = 8, height = 6, dpi = 300)
+ggsave(here(fig_dir, "figure_wind_rose_by_month.png"), plot = plot_wind_rose, width = 8, height = 6, dpi = 300)
 ```
 
-## 15) Dry deposition trajectories
+## 13) Size-dependent dry deposition trajectories
 
-We calculate a simple size-dependent dry deposition trajectory over 72 hours.
+Dry deposition trajectories are calculated over 72 hours to illustrate how quickly different particle-size classes settle vertically and how far they can travel horizontally under a constant reference wind speed. These trajectories provide a physical interpretation layer for observed size-fraction biological patterns.
 
 ```{r deposition}
 colnames(deposition_raw) <- c("size", "speed", "distance")
@@ -822,7 +727,7 @@ deposition_over_time <- deposition_raw %>%
 
 write_tsv(deposition_over_time, here(derived_dir, "deposition_over_time.tsv"))
 
-deposition_plot <- deposition_over_time %>%
+plot_deposition_time <- deposition_over_time %>%
   ggplot(aes(hours, distance_m, colour = factor(size), group = size)) +
   geom_line() +
   labs(
@@ -831,9 +736,11 @@ deposition_plot <- deposition_over_time %>%
     colour = "Particle size"
   )
 
-ggsave(here(fig_dir, "figure_dry_deposition_over_time.png"), deposition_plot, width = 7, height = 4, dpi = 300)
+plot_deposition_time
 
-deposition_wind_plot <- deposition_over_time %>%
+ggsave(here(fig_dir, "figure_dry_deposition_over_time.png"), plot = plot_deposition_time, width = 7, height = 4, dpi = 300)
+
+plot_deposition_wind <- deposition_over_time %>%
   ggplot(aes(wind_distance_km, distance_m, colour = factor(size), group = size)) +
   geom_line() +
   labs(
@@ -842,10 +749,14 @@ deposition_wind_plot <- deposition_over_time %>%
     colour = "Particle size"
   )
 
-ggsave(here(fig_dir, "figure_dry_deposition_with_wind.png"), deposition_wind_plot, width = 7, height = 4, dpi = 300)
+plot_deposition_wind
+
+ggsave(here(fig_dir, "figure_dry_deposition_with_wind.png"), plot = plot_deposition_wind, width = 7, height = 4, dpi = 300)
 ```
 
-## 16) Session information
+## 14) Session information
+
+Session information is saved at the end so software versions are documented with the analytical output.
 
 ```{r session-info}
 sessionInfo()
