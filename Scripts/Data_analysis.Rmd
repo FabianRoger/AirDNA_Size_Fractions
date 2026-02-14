@@ -3,9 +3,9 @@ title: "Airborne eDNA Size-Fraction Analysis"
 output: html_notebook
 ---
 
-This notebook documents the full analysis workflow used for the size-fraction airborne eDNA manuscript. The workflow starts from processed sequencing and metadata tables and produces the statistical outputs and figures used to interpret biological patterns across aerosol size classes and seasons.
+This notebook reports the full size-fraction airborne eDNA analysis used for the manuscript. It starts from processed sequencing and metadata tables and generates the quantitative summaries, statistical models, and figures used to interpret biological patterns across aerosol size classes and seasons.
 
-The analysis is organized as a linear manuscript workflow: data import, metadata harmonization, contaminant removal, diversity and composition analyses, integration with optical bioaerosol monitoring, and environmental context analyses.
+The workflow follows the analytical logic of the study: establish sequencing quality and control behavior, evaluate and remove contaminants, quantify richness and composition patterns across size fractions, integrate molecular data with optical bioaerosol observations, and provide meteorological and deposition context.
 
 ## 1) Analysis setup
 
@@ -128,11 +128,15 @@ sample_metadata %>%
   count(Type, season, SizeFrac, sort = TRUE)
 ```
 
-## 4) Sequencing depth and DNA concentration context
+## 4) Read-depth quality assessment and manuscript reporting statistics
 
-Before ecological inference, sequencing depth is summarized per sample and compared with DNA concentration measurements. These checks provide context on data yield across sample types and identify whether richness patterns could be strongly driven by extraction yield rather than aerosol size structure.
+This section evaluates library yield across positive samples and negative controls. The goal is to document sequencing depth distributions in a form that can be reported in the Methods/Results text, and to identify potential outliers such as low-read positive samples or high-read controls.
 
 ```{r read-summary}
+control_samples <- c("Extr_Bl", "S55", "S64", "S81")
+low_positive_threshold <- 5000
+high_control_threshold <- 5000
+
 sample_read_summary <- asv_table_raw %>%
   pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>%
   group_by(Sample) %>%
@@ -142,18 +146,97 @@ sample_read_summary <- asv_table_raw %>%
     .groups = "drop"
   ) %>%
   left_join(sample_metadata, by = "Sample") %>%
-  left_join(dna_concentration, by = "Sample")
+  left_join(dna_concentration, by = "Sample") %>%
+  mutate(
+    sample_class = case_when(
+      Sample %in% control_samples ~ "Negative control",
+      Type == "Blank" ~ "Negative control",
+      TRUE ~ "Positive sample"
+    )
+  )
 
 sample_read_summary %>%
   write_tsv(here(derived_dir, "sample_read_summary.tsv"))
 
+read_depth_stats <- sample_read_summary %>%
+  group_by(sample_class) %>%
+  summarise(
+    n_samples = n(),
+    mean_reads = mean(total_reads),
+    median_reads = median(total_reads),
+    min_reads = min(total_reads),
+    max_reads = max(total_reads),
+    .groups = "drop"
+  )
+
+read_depth_flags <- sample_read_summary %>%
+  mutate(
+    qc_flag = case_when(
+      sample_class == "Positive sample" & total_reads < low_positive_threshold ~ "Low-read positive",
+      sample_class == "Negative control" & total_reads >= high_control_threshold ~ "High-read control",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(qc_flag)) %>%
+  select(Sample, sample_class, Type, season, total_reads, n_detected_seq, qc_flag)
+
+method_read_stats <- sample_read_summary %>%
+  summarise(
+    n_positive_samples = sum(sample_class == "Positive sample"),
+    n_negative_controls = sum(sample_class == "Negative control"),
+    mean_reads_positive = mean(total_reads[sample_class == "Positive sample"]),
+    median_reads_positive = median(total_reads[sample_class == "Positive sample"]),
+    mean_reads_controls = mean(total_reads[sample_class == "Negative control"]),
+    median_reads_controls = median(total_reads[sample_class == "Negative control"]),
+    n_low_read_positive = sum(sample_class == "Positive sample" & total_reads < low_positive_threshold),
+    n_high_read_controls = sum(sample_class == "Negative control" & total_reads >= high_control_threshold)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "metric", values_to = "value")
+
+read_depth_stats %>%
+  write_tsv(here(derived_dir, "read_depth_summary_by_class.tsv"))
+read_depth_flags %>%
+  write_tsv(here(derived_dir, "read_depth_qc_flags.tsv"))
+method_read_stats %>%
+  write_tsv(here(derived_dir, "method_read_depth_stats.tsv"))
+
+list(
+  summary_by_class = read_depth_stats,
+  method_reporting_stats = method_read_stats,
+  flagged_samples = read_depth_flags
+)
+```
+
+```{r read-depth-interpretation}
+method_read_stats_wide <- method_read_stats %>%
+  pivot_wider(names_from = metric, values_from = value)
+
+cat(
+  "Sequencing depth summary:\\n",
+  "- Positive samples:", method_read_stats_wide$n_positive_samples, "\\n",
+  "- Negative controls:", method_read_stats_wide$n_negative_controls, "\\n",
+  "- Mean reads in positive samples:", round(method_read_stats_wide$mean_reads_positive), "\\n",
+  "- Median reads in positive samples:", round(method_read_stats_wide$median_reads_positive), "\\n",
+  "- Mean reads in controls:", round(method_read_stats_wide$mean_reads_controls), "\\n",
+  "- Median reads in controls:", round(method_read_stats_wide$median_reads_controls), "\\n",
+  "- Low-read positive samples (<", low_positive_threshold, "reads):", method_read_stats_wide$n_low_read_positive, "\\n",
+  "- High-read controls (>=", high_control_threshold, "reads):", method_read_stats_wide$n_high_read_controls, "\\n"
+)
+```
+
+The rank plot below visualizes sequencing depth spread within positive and control classes, and includes reference lines marking the thresholds used above for low-read positives and high-read controls.
+
+```{r read-depth-rank-plot}
 plot_reads_rank <- sample_read_summary %>%
   arrange(desc(total_reads)) %>%
   mutate(rank = row_number()) %>%
-  ggplot(aes(rank, total_reads, colour = Type)) +
+  ggplot(aes(rank, total_reads, colour = sample_class)) +
   geom_point() +
   scale_y_log10() +
-  facet_wrap(~Type)
+  geom_hline(yintercept = c(low_positive_threshold, high_control_threshold), linetype = "dashed") +
+  facet_wrap(~sample_class, scales = "free_x") +
+  scale_color_manual(values = c("Positive sample" = "#025196", "Negative control" = "#D1495B")) +
+  labs(x = "Sample rank by read count", y = "Total reads", colour = NULL)
 
 plot_reads_rank
 
@@ -166,8 +249,11 @@ ggsave(
 )
 ```
 
+DNA concentration and sequencing depth are plotted together for positive samples to show how extraction yield and sequencing yield co-vary across seasons and sample types.
+
 ```{r dna-vs-reads}
 plot_dna_reads <- sample_read_summary %>%
+  filter(sample_class == "Positive sample") %>%
   filter(!is.na(DNA_C)) %>%
   ggplot(aes(DNA_C, total_reads + 1, colour = season)) +
   geom_point() +
@@ -187,11 +273,11 @@ ggsave(
 )
 ```
 
-## 5) Remove known contaminants before ecological analyses
+## 5) Contaminant assessment and removal
 
-Human-assigned sequences and sequences detected in extraction/process blanks are removed before ecological analyses. This filtering step focuses inference on environmental airborne eDNA rather than laboratory-derived or human-source contamination.
+This section applies three contaminant checks: (i) sequences observed in the extraction blank, (ii) sequences observed in process blanks, and (iii) sequences taxonomically assigned to human. The union of these candidates is removed from all samples. Control samples are summarized before and after filtering to document whether high-read controls are dominated by candidate contaminants and how much residual signal remains.
 
-```{r remove-contaminants}
+```{r contaminant-checks}
 extraction_blank_sequences <- asv_table_raw %>%
   filter(Sample == "Extr_Bl") %>%
   pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>%
@@ -203,13 +289,53 @@ human_sequences <- taxonomy_table_raw %>%
   pull(seq)
 
 process_blank_sequences <- asv_table_raw %>%
-  filter(Sample %in% c("S55", "S64", "S81")) %>%
+  filter(Sample %in% control_samples[control_samples != "Extr_Bl"]) %>%
   pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>%
   filter(reads > 0) %>%
   pull(seq)
 
 sequences_to_remove <- unique(c(extraction_blank_sequences, human_sequences, process_blank_sequences))
 
+contaminant_catalog <- bind_rows(
+  tibble(seq = extraction_blank_sequences, source = "Extraction blank"),
+  tibble(seq = process_blank_sequences, source = "Process blanks"),
+  tibble(seq = human_sequences, source = "Human assignment")
+) %>%
+  distinct()
+
+control_contaminant_accounting <- asv_table_raw %>%
+  filter(Sample %in% control_samples) %>%
+  pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>%
+  filter(reads > 0) %>%
+  mutate(
+    contaminant_flag = case_when(
+      seq %in% sequences_to_remove ~ "candidate_contaminant",
+      TRUE ~ "not_flagged"
+    )
+  ) %>%
+  group_by(Sample, contaminant_flag) %>%
+  summarise(
+    reads = sum(reads),
+    n_seq = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = contaminant_flag, values_from = c(reads, n_seq), values_fill = 0) %>%
+  mutate(
+    prop_reads_candidate_contaminant = reads_candidate_contaminant / (reads_candidate_contaminant + reads_not_flagged)
+  )
+
+contaminant_catalog %>%
+  write_tsv(here(derived_dir, "contaminant_catalog.tsv"))
+control_contaminant_accounting %>%
+  write_tsv(here(derived_dir, "control_contaminant_accounting_before_filter.tsv"))
+
+list(
+  contaminant_sequence_sources = contaminant_catalog %>% count(source),
+  control_accounting_before_filter = control_contaminant_accounting
+)
+```
+
+```{r remove-contaminants}
 asv_table_clean <- asv_table_raw %>%
   select(-any_of(sequences_to_remove))
 
@@ -223,9 +349,57 @@ asv_table_clean %>%
 taxonomy_table_clean %>%
   write_tsv(here(derived_dir, "taxonomy_table_clean.tsv"))
 
-tibble(
+control_after_filter <- asv_table_clean %>%
+  filter(Sample %in% control_samples) %>%
+  pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>%
+  group_by(Sample) %>%
+  summarise(
+    reads_remaining = sum(reads),
+    n_seq_remaining = sum(reads > 0),
+    .groups = "drop"
+  )
+
+control_after_filter %>%
+  write_tsv(here(derived_dir, "control_signal_after_filter.tsv"))
+
+contaminant_removal_summary <- tibble(
   metric = c("raw_sequences", "removed_sequences", "clean_sequences"),
   n = c(ncol(asv_table_raw) - 1, length(sequences_to_remove), ncol(asv_table_clean) - 1)
+)
+
+contaminant_removal_summary
+control_after_filter
+```
+
+```{r contaminant-interpretation}
+control_after_summary <- control_after_filter %>%
+  summarise(
+    n_controls = n(),
+    n_controls_with_residual_reads = sum(reads_remaining > 0),
+    max_residual_reads = max(reads_remaining),
+    median_residual_reads = median(reads_remaining)
+  )
+
+control_before_summary <- control_contaminant_accounting %>%
+  summarise(
+    mean_prop_candidate_contaminant = mean(prop_reads_candidate_contaminant),
+    min_prop_candidate_contaminant = min(prop_reads_candidate_contaminant),
+    max_prop_candidate_contaminant = max(prop_reads_candidate_contaminant)
+  )
+
+cat(
+  "Contaminant filtering summary in controls:\\n",
+  "- Mean proportion of control reads flagged as candidate contaminants before filtering:",
+  round(control_before_summary$mean_prop_candidate_contaminant, 3), "\\n",
+  "- Range across controls:",
+  paste0(round(control_before_summary$min_prop_candidate_contaminant, 3), " to ",
+         round(control_before_summary$max_prop_candidate_contaminant, 3)), "\\n",
+  "- Controls with residual reads after filtering:",
+  control_after_summary$n_controls_with_residual_reads, "of", control_after_summary$n_controls, "\\n",
+  "- Median residual reads in controls after filtering:",
+  round(control_after_summary$median_residual_reads), "\\n",
+  "- Maximum residual reads in controls after filtering:",
+  round(control_after_summary$max_residual_reads), "\\n"
 )
 ```
 

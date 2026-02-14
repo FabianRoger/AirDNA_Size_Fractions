@@ -35,8 +35,12 @@ When updating manuscript scripts in this project:
 - Do not add defensive schema checks for missing columns; fix metadata upstream instead.
 - Use tidyverse pipes and readable object names.
 - Keep code chunks brief and separate analytical steps clearly.
-- Add clear markdown between chunks that explains analytical purpose and choice rationale.
-- Emphasize what each analysis evaluates and why it matters for interpretation.
+- Add clear markdown between chunks that explains analytical purpose, interpretation, and why each step is included.
+- Avoid generic workflow prose; describe concrete analytical questions and outcomes.
+- Include manuscript-reportable QC statistics early (for example positive/control sample counts, mean/median reads, low-read positives, high-read controls).
+- Include an explicit contamination assessment section with:
+  sequences observed in blanks, human-assigned sequences, and the union removed from all samples.
+- Report contaminant filtering effects with before/after summaries, including residual control signal after filtering.
 - Save intermediate tables as TSV in `Data/derived/` where useful.
 - Save final figures to a clearly named folder under `Figures/`.
 - Prioritize clarity and reproducibility over abstraction or engineering-heavy patterns.
