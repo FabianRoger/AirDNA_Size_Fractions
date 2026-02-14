@@ -1,1040 +1,852 @@
 ---
-title: "Data_analysis_final"
+title: "Airborne eDNA size-fraction analysis"
 output: html_notebook
 ---
 
-#notes
+This notebook is written as a one-time ecological analysis script with clear, readable steps.
 
-```{r}
-library(readr)
-library(googlesheets4)
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-library(MetBrewer)
+The workflow is:
+
+1. load all required data at the top,
+2. prepare metadata and clean the ASV table,
+3. run manuscript analyses,
+4. write intermediate tables and final figures to file.
+
+## 1) Setup
+
+We load the packages used in this notebook and set a few global options.
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
 library(here)
-library(ggrepel)
-library(ggpubr)
-library(phyloseq)
-library(DESeq2)
 library(readxl)
-library(lubridate) #for handiling dates in timeseries
-library(eulerr)
-library(rgbif)
-library(ggh4x)
-library(forcats) #for factor manipulation
-library(vegan) # for rarefaction
-library(broom) #for tidy statistical output
-library(fuzzyjoin) #for joining by timewindow
-library(zoo) # for rolling means
+library(lubridate)
+library(googlesheets4)
+library(vegan)
+library(iNEXT)
+library(fuzzyjoin)
+library(zoo)
+library(broom)
 library(car)
+library(suncalc)
+
+theme_set(theme_bw(base_size = 11))
 ```
 
+## 2) Paths and output folders
 
-# download data from Figshare
+We define all main paths once, then reuse them.
 
+```{r paths}
+data_dir <- here("Data")
+fig_dir <- here("Figures", "data_analysis_clean")
+derived_dir <- here("Data", "derived")
 
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(derived_dir, recursive = TRUE, showWarnings = FALSE)
 
-#import data
+path_asv <- here("Data", "COI_ASW_glom.txt")
+path_tax <- here("Data", "COI_taxa_80_glom.txt")
+path_prob <- here("Data", "COI_Sintax_prob.txt")
+path_dna <- here("Data", "DNA_concentration_HS.txt")
+path_diversity_output <- here("Data", "derived", "diversity_estimates_iNEXT.tsv")
+path_matched <- here("Data", "Matched_DNA_Biotrack.txt")
+path_sample_meta_local <- here("Data", "sample_meta.tsv")
 
-```{r}
-# clustered ASV table (with Swarm)
-ASV_COI <- read_tsv(here::here("Data", "COI_ASW_glom.txt"))
+path_biotrack_fall_1 <- here("Data", "Hyltemossa_20201006.xlsx")
+path_biotrack_fall_2 <- here("Data", "Hyltemossa_20201022.xlsx")
+path_biotrack_spring_1 <- here("Data", "Hyltemossa_20210428.xlsx")
+path_biotrack_spring_2 <- here("Data", "Hyltemossa_20210524.xlsx")
 
-# taxonomic assignment with SINTAX with 80% probability threshold and agglomerated sequences at species or genus level. All unassigned sequences have also been kept.
-tax_COI <- read_tsv(here::here("Data", "COI_taxa_80_glom.txt"))
+path_weather_30m <- here("Data", "ICOS", "My data cart", "ICOS_ATC_NRT_HTM_2021-02-01_2022-02-28_30.0_612.MTO")
+path_precip <- here("Data", "ICOS", "SE-Htm_meteo_2020_CP_flag.txt")
+path_deposition <- here("Data", "deposition_speed.txt")
 
-prob_COI <- read_tsv(here::here("Data", "COI_Sintax_prob.txt"))
+required_input_files <- c(
+  path_asv, path_tax, path_prob, path_dna,
+  path_biotrack_fall_1, path_biotrack_fall_2,
+  path_biotrack_spring_1, path_biotrack_spring_2,
+  path_weather_30m, path_precip, path_deposition
+)
 
-sample_meta_path <- here("Data", "sample_meta.tsv")
+missing_input_files <- required_input_files[!file.exists(required_input_files)]
+if (length(missing_input_files) > 0) {
+  stop(
+    "Missing required input files:\n",
+    paste(missing_input_files, collapse = "\n")
+  )
+}
+```
+
+## 3) Load all raw data
+
+All raw inputs are read in this section so data dependencies are explicit.
+
+```{r load-data, message=TRUE}
+# Core metabarcoding tables
+asv_table_raw <- read_tsv(path_asv, show_col_types = FALSE)
+taxonomy_table_raw <- read_tsv(path_tax, show_col_types = FALSE)
+taxonomy_probabilities <- read_tsv(path_prob, show_col_types = FALSE)
+dna_concentration <- read_tsv(path_dna, show_col_types = FALSE)
+
+# Metadata: local file by default, optional refresh from Google Sheet
 sample_meta_url <- "https://docs.google.com/spreadsheets/d/1AMpJDHXKzxpfitL9JML8e-8vKTjnSNZT2oq84qmRmuM/edit?usp=sharing"
 refresh_sample_meta <- tolower(Sys.getenv("REFRESH_SAMPLE_META", "false")) == "true"
 
-if (refresh_sample_meta || !file.exists(sample_meta_path)) {
+if (refresh_sample_meta || !file.exists(path_sample_meta_local)) {
   gs4_deauth()
   sample_meta_raw <- read_sheet(sample_meta_url, col_types = "c")
-  write_tsv(sample_meta_raw, sample_meta_path)
+  write_tsv(sample_meta_raw, path_sample_meta_local)
 } else {
-  sample_meta_raw <- read_tsv(sample_meta_path, show_col_types = FALSE)
+  sample_meta_raw <- read_tsv(path_sample_meta_local, show_col_types = FALSE)
 }
 
-required_cols <- c("Sample_ID", "Type", "Start_Date", "End_Date", "Time_h", "SizeFrac", "Blank", "Location", "Description")
+# Biotrack campaign files
+biotrack_fall_1_raw <- read_excel(path_biotrack_fall_1)
+biotrack_fall_2_raw <- read_excel(path_biotrack_fall_2)
+biotrack_spring_1_raw <- read_excel(path_biotrack_spring_1)
+biotrack_spring_2_raw <- read_excel(path_biotrack_spring_2)
+
+# Weather and deposition inputs
+weather_30m_raw <- read_delim(path_weather_30m, delim = ";", skip = 38, show_col_types = FALSE)
+precip_raw <- read_delim(path_precip, delim = ",", show_col_types = FALSE)
+deposition_raw <- read_tsv(path_deposition, show_col_types = FALSE)
+
+# Optional precomputed table
+matched_dna_biotrack_existing <- if (file.exists(path_matched)) {
+  read_tsv(path_matched, show_col_types = FALSE)
+} else {
+  NULL
+}
+
+tibble(
+  object = c("asv_table_raw", "taxonomy_table_raw", "taxonomy_probabilities", "sample_meta_raw", "dna_concentration"),
+  rows = c(nrow(asv_table_raw), nrow(taxonomy_table_raw), nrow(taxonomy_probabilities), nrow(sample_meta_raw), nrow(dna_concentration)),
+  cols = c(ncol(asv_table_raw), ncol(taxonomy_table_raw), ncol(taxonomy_probabilities), ncol(sample_meta_raw), ncol(dna_concentration))
+)
+```
+
+## 4) Prepare sample metadata
+
+We standardize metadata columns, parse dates, define season, and map size-fraction labels.
+
+```{r prepare-metadata}
+required_meta_cols <- c(
+  "Sample_ID", "Type", "Start_Date", "End_Date", "Time_h",
+  "SizeFrac", "Blank", "Location", "Description"
+)
+
 if (!"Sample_ID" %in% names(sample_meta_raw) && "Sample" %in% names(sample_meta_raw)) {
-  sample_meta_raw <- sample_meta_raw %>% dplyr::rename(Sample_ID = Sample)
+  sample_meta_raw <- sample_meta_raw %>% rename(Sample_ID = Sample)
 }
-missing_cols <- setdiff(required_cols, names(sample_meta_raw))
+
+missing_cols <- setdiff(required_meta_cols, names(sample_meta_raw))
 if (length(missing_cols) > 0) {
-  for (cn in missing_cols) sample_meta_raw[[cn]] <- NA_character_
+  for (nm in missing_cols) sample_meta_raw[[nm]] <- NA_character_
 }
 
-sample_meta <- 
-sample_meta_raw %>% 
-  select(all_of(required_cols)) %>% 
-  dplyr::rename(Sample = Sample_ID) %>% 
-  mutate(Start_Date = ymd_hms(Start_Date, truncated = 3)) %>% 
-  mutate(End_Date = ymd_hms(End_Date, truncated = 3)) %>% 
-   mutate(season = case_when(Start_Date < ymd("2020-11-01") ~ "Fall",
-                            TRUE ~ "Spring")) %>% 
-  mutate(Time_h = as.numeric(as.numeric(Time_h))) %>% 
-  mutate(Time_h = case_when(is.na(Time_h) ~ make_difftime(End_Date - Start_Date, units = "h"),
-                            TRUE ~ make_difftime(Time_h*3600, units = "h"))) %>% 
-  bind_rows(tibble(Sample_ID = paste("BLANK", 1:7, sep = ""),
-                   Blank = "Blank")) %>% 
-  filter(Sample %in% unique(c(ASV_COI$Sample))) %>% 
-  mutate(SizeFrac = as.character(SizeFrac),
-         SizeFrac_num = suppressWarnings(as.numeric(SizeFrac))) %>% 
-  arrange(desc(SizeFrac_num)) %>% 
-  mutate(SizeFrac = factor(SizeFrac_num,
-                           levels = sort(unique(SizeFrac_num), decreasing = TRUE),
-                           labels = c("< 0.37","0.37","0.60","1.03","1.82",
-                                      "3.09","4.89","8.83")[seq_along(sort(unique(SizeFrac_num), decreasing = TRUE))])) %>% 
-  select(-SizeFrac_num) %>% 
-  mutate(Type = case_when(is.na(Blank) ~ Type,
-                          TRUE ~ Blank))
-#DNA concentrations
-DNA_conc <- read_tsv(here("Data", "DNA_concentration_HS.txt"))
+sample_metadata <- sample_meta_raw %>%
+  select(all_of(required_meta_cols)) %>%
+  rename(Sample = Sample_ID) %>%
+  mutate(
+    Start_Date = ymd_hms(Start_Date, truncated = 3),
+    End_Date = ymd_hms(End_Date, truncated = 3),
+    season = case_when(
+      Start_Date < ymd("2020-11-01") ~ "Fall",
+      TRUE ~ "Spring"
+    ),
+    Time_h = as.numeric(Time_h),
+    Time_h = case_when(
+      is.na(Time_h) & !is.na(Start_Date) & !is.na(End_Date) ~ as.numeric(difftime(End_Date, Start_Date, units = "hours")),
+      TRUE ~ Time_h
+    ),
+    Type = case_when(is.na(Blank) ~ Type, TRUE ~ Blank),
+    SizeFrac = as.character(SizeFrac),
+    SizeFrac = recode(
+      SizeFrac,
+      "1" = "8.83",
+      "2" = "4.89",
+      "3" = "3.09",
+      "4" = "1.82",
+      "5" = "1.03",
+      "6" = "0.60",
+      "7" = "0.37",
+      "8" = "< 0.37"
+    ),
+    SizeFrac = factor(SizeFrac, levels = c("< 0.37", "0.37", "0.60", "1.03", "1.82", "3.09", "4.89", "8.83"))
+  ) %>%
+  filter(Sample %in% asv_table_raw$Sample)
+
+write_tsv(sample_metadata, here(derived_dir, "sample_metadata_prepared.tsv"))
+
+sample_metadata %>%
+  count(Type, season, SizeFrac, sort = TRUE)
 ```
 
+## 5) Initial sample-level checks
 
-#Checking
+These quick checks help confirm sequencing depth and how it relates to DNA concentration.
 
-```{r}
-Sample_summary <- 
-ASV_COI %>% 
-  pivot_longer(-Sample) %>% 
-  group_by(Sample) %>% 
-  summarise(reads = sum(value),
-            nseqs = sum(value > 0))
+```{r sample-summary}
+sample_read_summary <- asv_table_raw %>%
+  pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>%
+  group_by(Sample) %>%
+  summarise(
+    total_reads = sum(reads),
+    n_detected_seq = sum(reads > 0),
+    .groups = "drop"
+  ) %>%
+  left_join(sample_metadata, by = "Sample") %>%
+  left_join(dna_concentration, by = "Sample")
 
-Sample_summary %>% 
-  arrange(desc(reads)) %>% 
-  mutate(rank = 1:n()) %>% 
-  left_join(sample_meta) %>% 
-  ggplot(aes(x = rank, y = reads, colour = Type))+
-  geom_point()+
-  facet_wrap(~Type)+
-  scale_y_log10()
+write_tsv(sample_read_summary, here(derived_dir, "sample_read_summary.tsv"))
+
+sample_read_summary %>%
+  arrange(desc(total_reads)) %>%
+  mutate(rank = row_number()) %>%
+  ggplot(aes(rank, total_reads, colour = Type)) +
+  geom_point() +
+  scale_y_log10() +
+  facet_wrap(~Type)
+
+ggsave(
+  filename = here(fig_dir, "qc_reads_by_sample_rank.png"),
+  width = 7,
+  height = 4,
+  dpi = 300
+)
 ```
 
+```{r dna-vs-reads}
+sample_read_summary %>%
+  filter(!is.na(DNA_C)) %>%
+  ggplot(aes(DNA_C, total_reads + 1, colour = season)) +
+  geom_point() +
+  facet_wrap(~Type) +
+  scale_y_log10() +
+  geom_hline(yintercept = 2e4, linetype = "dashed") +
+  labs(x = "DNA concentration", y = "Reads")
 
-```{r}
-Sample_summary %>% 
-  left_join(DNA_conc) %>% 
-  left_join(sample_meta) %>%
-  ggplot(aes(x = DNA_C, y = reads+1, colour = season))+
-  geom_point()+
-  geom_hline(yintercept = 2e4, linetype = "dashed")+
-  facet_wrap(~Type)+
-  scale_y_log10()+
-  theme_bw()
+ggsave(
+  filename = here(fig_dir, "qc_dna_vs_reads.png"),
+  width = 7,
+  height = 4,
+  dpi = 300
+)
 ```
 
+## 6) Remove contaminants (human and blanks)
 
-#Cleaning
+We remove sequences identified as human or present in blank controls.
 
-### Extraction Blank
-
-```{r}
-Extr_B <- 
-  ASV_COI %>% 
-  filter(Sample %in% c("Extr_Bl")) %>% 
-  pivot_longer(cols = starts_with("seq"), names_to = "seq") %>% 
-  filter(value > 0) %>% 
-  left_join(tax_COI)
-
-Extr_B
-```
-The Extraction Blank contains 47308 reads of a single OTU, identified as Human
-
-### Human
-
-```{r}
-seq_hs <- 
-tax_COI %>% 
-  filter(genus == "Homo") %>% 
+```{r remove-contaminants}
+extraction_blank_sequences <- asv_table_raw %>%
+  filter(Sample == "Extr_Bl") %>%
+  pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>%
+  filter(reads > 0) %>%
   pull(seq)
 
-HS_prct <- 
-ASV_COI %>% 
-  select("Sample", all_of(seq_hs)) %>% 
-  pivot_longer(starts_with("seq")) %>% 
-  group_by(Sample) %>% 
-  summarise(value = sum(value)) %>%
+human_sequences <- taxonomy_table_raw %>%
+  filter(genus == "Homo") %>%
+  pull(seq)
+
+process_blank_sequences <- asv_table_raw %>%
+  filter(Sample %in% c("S55", "S64", "S81")) %>%
+  pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>%
+  filter(reads > 0) %>%
+  pull(seq)
+
+sequences_to_remove <- unique(c(extraction_blank_sequences, human_sequences, process_blank_sequences))
+
+asv_table_clean <- asv_table_raw %>%
+  select(-any_of(sequences_to_remove))
+
+taxonomy_table_clean <- taxonomy_table_raw %>%
+  filter(seq %in% colnames(asv_table_clean))
+
+write_tsv(tibble(seq_removed = sequences_to_remove), here(derived_dir, "removed_sequences.tsv"))
+write_tsv(asv_table_clean, here(derived_dir, "asv_table_clean.tsv"))
+write_tsv(taxonomy_table_clean, here(derived_dir, "taxonomy_table_clean.tsv"))
+
+tibble(
+  metric = c("raw_sequences", "removed_sequences", "clean_sequences"),
+  n = c(ncol(asv_table_raw) - 1, length(sequences_to_remove), ncol(asv_table_clean) - 1)
+)
+```
+
+## 7) Taxonomic composition by size fraction
+
+We summarize OTUs by rank and produce manuscript-style phylum composition plots.
+
+```{r taxa-distribution}
+ngi_taxa_distribution <- asv_table_clean %>%
+  pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>%
+  filter(reads > 0) %>%
+  left_join(sample_metadata, by = "Sample") %>%
+  filter(Type == "NGI") %>%
+  left_join(taxonomy_table_clean, by = "seq") %>%
+  pivot_longer(
+    cols = c("kingdom", "phylum", "class", "order", "family", "genus", "species"),
+    names_to = "rank",
+    values_to = "taxa"
+  ) %>%
   left_join(
-    tibble(Sample = ASV_COI$Sample, 
-           all_reads = rowSums(ASV_COI[,-1]))) %>% 
-#  mutate(prct = round(value/all_reads*100)) %>% 
-#  summarise(value = sum(value), all_reads = sum(all_reads)) %>%
-  mutate(prct = value/all_reads *100) %>% 
-  {}
+    taxonomy_probabilities %>%
+      pivot_longer(-seq, names_to = "rank", values_to = "probability"),
+    by = c("seq", "rank")
+  ) %>%
+  mutate(
+    taxa = replace_na(taxa, "not assigned"),
+    probability = if_else(taxa == "not assigned", NA_real_, probability)
+  ) %>%
+  group_by(Sample, rank, taxa, season, probability) %>%
+  summarise(n_otu = n(), .groups = "drop")
 
-HS_prct %>% 
-left_join(sample_meta) %>% 
-  ggplot(aes(x =SizeFrac, y = prct, colour = season))+
-  geom_point( size = 2, position = position_dodge(width = 0.5), alpha = 0.8)
- 
-HS_prct %>% 
-  left_join(DNA_conc) %>% 
-  ggplot(aes(x = DNA_C, y = prct))+
-  geom_point()
-  
+write_tsv(ngi_taxa_distribution, here(derived_dir, "ngi_taxa_distribution.tsv"))
 ```
 
+```{r phylum-plot}
+phylum_focus <- c("Ascomycota", "Basidiomycota", "Arthropoda")
 
-##NGI
+ngi_phylum_relative <- ngi_taxa_distribution %>%
+  filter(rank == "phylum", taxa %in% phylum_focus) %>%
+  left_join(sample_metadata %>% select(Sample, SizeFrac, season), by = c("Sample", "season")) %>%
+  group_by(Sample, SizeFrac, season, taxa) %>%
+  summarise(n_otu = sum(n_otu), .groups = "drop") %>%
+  group_by(SizeFrac, season, taxa) %>%
+  summarise(n_otu = mean(n_otu), .groups = "drop") %>%
+  group_by(SizeFrac, season) %>%
+  mutate(total_otu = sum(n_otu), relative_otu = n_otu / total_otu) %>%
+  ungroup()
 
-For the NGI we took three process blanks at three sampling occasion which consist of the sterile Swab and the Lysis Buffer
+phylum_label_df <- ngi_phylum_relative %>%
+  distinct(SizeFrac, season, total_otu) %>%
+  mutate(total_otu = round(total_otu), y = 0.5)
 
-`S55`, `S64`, `S81`
+write_tsv(ngi_phylum_relative, here(derived_dir, "ngi_relative_phylum_abundance.tsv"))
 
-```{r}
+ngi_phylum_relative %>%
+  ggplot(aes(SizeFrac, relative_otu, fill = taxa)) +
+  geom_col() +
+  geom_text(
+    data = phylum_label_df,
+    aes(y = y, label = total_otu),
+    colour = "white",
+    inherit.aes = FALSE
+  ) +
+  facet_grid(~season) +
+  scale_fill_manual(values = c("#081A5A", "#E74137", "#DAA520")) +
+  labs(
+    x = "Aerodynamic diameter D50 (um)",
+    y = "Relative abundance of OTUs",
+    fill = NULL
+  ) +
+  theme(legend.position = "bottom")
 
-S_blanks <- 
-  ASV_COI %>% 
-  filter(Sample %in% c("S55", "S64", "S81")) %>% 
-  pivot_longer(cols = starts_with("seq"), names_to = "seq") %>% 
-  filter(value > 0) %>% 
-  left_join(tax_COI)
-
-S_blanks 
-
-```
-There are only 4 sequences present across the process blanks, one humans sequence and 3 unidentified sequences. We remove all three. 
-
-## remove sequences
-
-I remove all sequences that are
-
-1) identified as humans
-2) present in the extraction blank (only HS)
-
-```{r}
-ASV_COI_clean <- ASV_COI
-
-seq_excl <- unique(c(Extr_B$seq, seq_hs, S_blanks$seq))
-
-ASV_COI_clean <- 
-  ASV_COI_clean %>% 
-  select(!one_of(seq_excl))
-
-tax_COI_clean <- tax_COI %>% filter(seq %in% colnames(ASV_COI_clean))
-
-```
-
-#Analysis
-
-
-###phyla distribution
-
-```{r}
-NGI_taxa_dist <- 
-ASV_COI_clean %>% 
- pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>% 
-  filter(reads > 0) %>% 
-  left_join(sample_meta) %>% 
-  filter(Type == "NGI") %>% 
-  left_join(tax_COI_clean) %>% 
-  pivot_longer(one_of("kingdom","phylum","class","order","family","genus","species"),
-               names_to = "rank", values_to = "taxa") %>% 
-  left_join(pivot_longer(prob_COI, -seq, names_to = "rank", values_to = "prob")) %>% 
-  mutate(prob = case_when(is.na(taxa) ~ NA_real_,
-                          TRUE ~ prob)) %>% 
-  mutate(taxa = ifelse(is.na(taxa), "not assigned", taxa)) %>% 
-  mutate(prob = round(prob, 1)) %>% 
-  group_by(Sample, rank, taxa, season, prob) %>% 
-  summarise(N = n())
-
-
-
-NGI_taxa_dist %>%
-  group_by(rank, taxa, season, prob) %>% 
-  summarise(N = sum(N)) %>% 
-  filter(rank == "phylum") %>% 
-  arrange(N, desc(prob)) %>%
-  mutate(taxa = factor(taxa, levels = unique(.$taxa))) %>% 
-  mutate(taxa = forcats::fct_relevel(taxa, "not assigned", after = 0L)) %>% 
-  mutate(taxa = forcats::fct_relevel(taxa, "Ascomycota", after = Inf)) %>% 
-  ggplot(., aes(x = taxa, y = N, fill = factor(prob)))+
-  geom_bar(position = "stack", stat = "identity")+
-  facet_wrap(~season)+
-  coord_flip()+
-  scale_fill_manual(values=met.brewer("Homer2", 5, type="continuous"),
-                    na.value = "grey",
-                    labels = c("[0.8-0.85]","(0.85-0.95)","[0.95-1]"),
-                    name = "bootstrap\nprobability",
-                    na.translate=TRUE,
-                    guide = guide_legend(reverse = TRUE, nrow = 2, byrow = TRUE))+
-  scale_alpha(guide = 'none')+
-  theme_minimal()+
-  theme(legend.position = "bottom")+
-  labs(title = "Fall - N° OTUs / phylum")
-  
-  NGI_taxa_dist$prob %>% unique()
-  
+ggsave(here(fig_dir, "figure_relative_phylum_abundance.png"), width = 8, height = 4, dpi = 300)
+ggsave(here(fig_dir, "figure_relative_phylum_abundance.pdf"), width = 8, height = 4)
 ```
 
-```{r}
+## 8) Rarefaction curves
 
-NGI_tax_plot_df <- 
-NGI_taxa_dist %>%
-  filter(rank == "phylum") %>% 
-  filter(taxa %in%  c("Ascomycota", "Basidiomycota", "Arthropoda")) %>% 
-  left_join(sample_meta) %>% 
-  group_by(Sample, SizeFrac,taxa,season) %>% 
-  summarise(N = sum(N)) %>% 
-  group_by(SizeFrac,taxa,season) %>% 
-  summarise(N = mean(N)) %>% 
-  group_by(SizeFrac,season) %>% 
-  mutate(sum_N = sum(N),
-         N = N / sum(N)) %>% 
-  filter(taxa %in%  c("Ascomycota", "Basidiomycota", "Arthropoda")) 
+We compute rarefaction curves for major phyla and save the tidy output.
 
-NGI_tax_plot_df_annot <- 
-  NGI_tax_plot_df %>% 
-  group_by(SizeFrac, season) %>% 
-  summarise(sum_N = round(mean(sum_N))) %>% 
-  arrange(season, SizeFrac) %>% 
-  ungroup() %>% 
-  mutate(y_label = rep(c(0.44,0.54),8))
-
-#NGI_tax_plot <- 
-NGI_tax_plot_df %>% 
-ggplot(., aes(x = SizeFrac, y = sum_N))+
-  geom_bar(position = "stack", stat = "identity", aes(fill = taxa))+
-  geom_text(data = NGI_tax_plot_df_annot, 
-            aes(label = sum_N, y = y_label), 
-            colour = "white")+
-  facet_grid(~season, scales = "free_y")+
-  theme_minimal()+
-  theme(legend.position = "bottom")+
-  scale_fill_manual(values = c("#081a5a","#E74137","#daa520"))+
-  labs(x = expression(D[50]~aeorodynamic~diameter~{"(in µm)"}),
-       y = "relative abundance of OTUs",
-       fill = NULL)
-
-#ggsave(here("Figures", "Relative_phylum_abundance.pdf"), width = 6, height = 4) 
-#ggsave(here("Figures", "Relative_phylum_abundance.jpg"), width = 6, height = 4) 
-```
-
-
-### rarefaction curves
-```{r}
-rarstep = 200
-
-ASV_COI_M <- as.matrix(ASV_COI_clean[,-1])
-
-rownames(ASV_COI_M) <- ASV_COI_clean$Sample
-
-ASV_COI_M <- ASV_COI_M[rowSums(ASV_COI_M) > 0,]
-
+```{r rarefaction}
 main_phyla <- c("Arthropoda", "Ascomycota", "Basidiomycota", "Chordata")
 
-ASV_COI_M_list <- lapply(main_phyla, function(x){
-  
-  what_seq <- filter(tax_COI_clean, phylum == x) %>% pull(seq)
-  out <- ASV_COI_M[,what_seq]
-  out <- out[rowSums(out) > 0,]
-  return(out)
-  
-})
+asv_matrix_clean <- asv_table_clean %>%
+  column_to_rownames("Sample") %>%
+  as.matrix()
 
-names(ASV_COI_M_list) <- main_phyla
+asv_matrix_clean <- asv_matrix_clean[rowSums(asv_matrix_clean) > 0, , drop = FALSE]
 
-COI_rar <- lapply(ASV_COI_M_list, function(x) {
+rarefaction_list <- list()
 
-  rarecurve(x, step = rarstep, tidy = TRUE)
-  
-})
+for (phylum_name in main_phyla) {
+  seq_ids <- taxonomy_table_clean %>%
+    filter(phylum == phylum_name) %>%
+    pull(seq)
 
+  phylum_matrix <- asv_matrix_clean[, intersect(seq_ids, colnames(asv_matrix_clean)), drop = FALSE]
+  phylum_matrix <- phylum_matrix[rowSums(phylum_matrix) > 0, , drop = FALSE]
 
-df <-COI_rar %>% bind_rows(.id = "Phylum") %>% 
-  dplyr::rename(size = Sample) %>% 
-  dplyr::rename(Sample = Site)
+  if (ncol(phylum_matrix) == 0 || nrow(phylum_matrix) == 0) next
 
-```
-
-```{r}
-
-df %>% 
-  left_join(sample_meta) %>% 
-  filter(!grepl("-", Sample)) %>% 
-  filter(Type == "NGI") %>% 
-  ggplot(aes(x = size, y = Species, group = Sample, colour = season))+
-  geom_line()+
-  facet_wrap(~Phylum, scales = "free_y")+
-  scale_color_manual(values = c("#025196", "#FDB338"))+
-  scale_x_continuous(limits = c(0,2e4))+
-  theme_bw()+
-  theme(legend.position = "bottom",
-        axis.text.x = element_text(angle = -45, hjust = 0))+
-  labs(x = "reads", y = "OTUs")
-
-```
-
-### diversity
-```{r}
-
-
-COI_div_exp <- lapply(ASV_COI_M_list, function(x) {
-  
-  out <- iNEXT::iNEXT(t(x), 
-                    datatype = "abundance", 
-                    q = c(0),
-                    nboot = 10
-                    )
-  
-  return(out)
-  
-})
-
-COI_div_exp_df <- 
-lapply(COI_div_exp, function(x){
-  
-  x$iNextEst$coverage_based %>% 
-    dplyr::rename(Sample = Assemblage) %>% 
-    group_by(Sample) %>% 
-    filter(SC == 1) %>% 
-    filter(m == max(m)) %>% 
-    dplyr::slice(1)
-  
-}) %>% 
-  bind_rows(.id = "phylum")
-
-write_tsv(COI_div_exp_df, here("Data", "COI_div_exp_df.txt"))
-
-COI_div_exp_df <- read_tsv(here("Data", "COI_div_exp_df.txt"))
-```
-
-```{r}
-
-plot_divsize <- 
-COI_div_exp_df %>% 
-  filter(phylum != "Chordata") %>% 
-  left_join(sample_meta) %>% 
-  filter(Type == "NGI")%>% 
-  ggplot(aes(x =SizeFrac, y = qD, colour = season))+
-  geom_point( size = 1, position = position_dodge(width = 0.5), alpha = 0.5)+
-  geom_line(aes(group = Start_Date), size = 0.3, alpha = 0.4, position = position_dodge(width = 0.5))+
-  geom_smooth(aes(group = season), se = FALSE)+
-  facet_grid(phylum~., scales = "free")+
-  theme_bw(base_size = 15)+
-  # geom_vline(xintercept = ymd("20201003","20201019",
-  #                             "20210502","20210517"),
-  #            colour = "darkred", size = 0.2)+
-  scale_color_manual(values = c("#025196", "#FDB338"))+
-  labs(y = "OTU richness", x = "Size fraction")+
-  theme(legend.position = "right", #c(0.2, 0.85),
-        axis.text.x = element_text(angle = 45, hjust = 1))+
-  labs(x = expression(D[50]~aeorodynamic~diameter~{"(in µm)"}), 
-       y = "OTU richness")
-
-#ggsave(plot = plot_divsize, file =here("Figures", "NGI_div_sizefrac.pdf"), width = 4, height = 6)
-#ggsave(plot = plot_divsize, file =here("Figures", "NGI_div_sizefrac.jpg"), width = 4, height = 6)
-
-plot_divsize
-```
-###DNA_vs_div
-
-```{r}
-COI_div_exp_df %>% 
-  left_join(sample_meta) %>% 
-  filter(Type == "NGI")%>% 
-  left_join(DNA_conc) %>% 
-  filter(phylum != "Chordata") %>% 
-  ggplot(aes(x = DNA_C, y = qD, colour = season))+
-  geom_point(alpha = 0.8, size = 0.8)+
-  facet_grid(phylum~season, scales = "free_y")+
-  theme_bw()+
-  geom_smooth(method = "lm", se = F, size = 0.2, aes(group = interaction(season, SizeFrac)))+
-  geom_smooth(method = "lm", se = F, size = 0.8, aes(group = interaction(season, phylum), colur = season))+
-  scale_color_manual(values = c("#025196", "#FDB338"))+
-  scale_x_log10()+
-  scale_y_log10()
-```
-
-test 
-
-```{r}
-
-lm_DNA_C <- 
-COI_div_exp_df %>% 
-  left_join(sample_meta) %>% 
-  filter(Type == "NGI")%>% 
-  left_join(DNA_conc) %>% 
-  lm(log(qD) ~ season + phylum + SizeFrac + log10(DNA_C), data  = .)
-
-lm_DNA_C %>% 
-  Anova(type = 2) %>% 
-  tidy() %>% 
-  mutate(across(is.numeric, ~signif(.,2)))
-
-plot(lm_DNA_C)
-```
-
-### NMDS
-
-Given that the size fractions strongly differ in Richness, community composition is confounded with richness 
-```{r}
-
-ASV_NGI <- 
-ASV_COI_clean %>% 
-  filter(grepl("^S", Sample)) %>% 
-  select(1, function(col) is.numeric(col) && sum(col) > 0) %>% 
-  filter(rowSums(.[,-1]) > 0) %>% 
-  filter(sum(rowSums(.[,-1]) > 0)>10)
-
-ASV_NGI_M <- as.matrix(ASV_NGI[,-1])
-
-rownames(ASV_NGI_M) <- ASV_NGI$Sample
-
-NGI_nmds <- 
-ASV_NGI_M %>% 
-  vegan::metaMDS(distance = "bray", autotransform = TRUE)
-
-NGI_nmds$points %>% 
-  as_data_frame() %>% 
-  mutate(Sample = rownames(ASV_NGI_M)) %>% 
-  left_join(sample_meta) %>% 
-  filter(SizeFrac != "< 0.37") %>% 
-  ggplot(aes(x = MDS1, y=MDS2))+
-  geom_point(aes(colour = SizeFrac))+
-  facet_wrap(~season)+
-  theme_bw()
-```
-
-heatmap
-```{r}
-ASV_NGI <- 
-ASV_COI_clean %>% 
-  filter(grepl("^S", Sample)) %>% 
-  select(1, function(col) is.numeric(col) && sum(col) > 0) %>% 
-  filter(rowSums(.[,-1]) > 0) %>% 
-  pivot_longer(-Sample, names_to = "seq") %>% 
-  group_by(Sample, seq) %>% 
-  mutate(value = sum(value)) %>% 
-  left_join(sample_meta) %>% 
-  group_by(Sample) %>% 
-  arrange(desc(value)) %>% 
-  dplyr::slice(1:50)
-
-ASV_COI_clean %>% 
-  filter(Sample %in% ASV_NGI$Sample) %>% 
-  select(Sample, unique(ASV_NGI$seq)) %>% 
-  pivot_longer(-Sample, names_to = "seq") %>% 
-  arrange(desc(value)) %>% 
-  mutate(seq = factor(seq, levels = unique(.$seq))) %>% 
-  left_join(sample_meta) %>% 
-  arrange(season, SizeFrac) %>% 
-  mutate(Sample = factor(Sample, levels = unique(.$Sample))) %>% 
-  ggplot(aes(x = Sample, y = seq, fill = log10(value)))+
-  geom_tile()+
-  facet_wrap(season~SizeFrac,ncol = 8, scales = "free_x")+
-  scale_fill_viridis_c(na.value = "white")+
-  theme(axis.text.x = element_text(angle = 90),
-        axis.text.y= element_text(size = 1))
-
-```
-
-# Biotrack data
-
-```{r}
-Biotrack_fall_1 <- 
-  read_excel(here("Data", "Hyltemossa_20201006.xlsx")) %>% 
-  filter(!is.na(Date)) %>% 
-  select(Date, Time, starts_with("Ch"), FlowStatus, Laser_Status, Vol_L) %>% 
-  pivot_longer(cols = starts_with("Ch"), names_to = "Size_frac", values_to = "count") %>% 
-  mutate(type = case_when(grepl("Value", Size_frac) ~ "all",
-                          TRUE ~"bio")) %>% 
-  mutate(Size_frac = substr(Size_frac, 1, 3)) %>% 
-  pivot_wider(names_from = type, values_from = count) %>% 
-  mutate(season = "Fall")
-
-Biotrack_fall_2 <- 
-  read_excel(here("Data", "Hyltemossa_20201022.xlsx")) %>% 
-  filter(!is.na(Date)) %>% 
-  select(Date, Time, starts_with("Ch"), FlowStatus, Laser_Status, Vol_L) %>% 
-  pivot_longer(cols = starts_with("Ch"), names_to = "Size_frac", values_to = "count") %>% 
-  mutate(type = case_when(grepl("Value", Size_frac) ~ "all",
-                          TRUE ~"bio")) %>% 
-  mutate(Size_frac = substr(Size_frac, 1, 3)) %>% 
-  pivot_wider(names_from = type, values_from = count) %>%  
-  mutate(season = "Fall")
-  
-Biotrack_spring_1 <- 
-  read_excel(here("Data", "Hyltemossa_20210428.xlsx")) %>% 
- filter(!is.na(Date)) %>% 
-  select(Date, Time, starts_with("Ch"), FlowStatus, Laser_Status, Vol_L) %>% 
-  pivot_longer(cols = starts_with("Ch"), names_to = "Size_frac", values_to = "count") %>% 
-  mutate(type = case_when(grepl("Value", Size_frac) ~ "all",
-                          TRUE ~"bio")) %>% 
-  mutate(Size_frac = substr(Size_frac, 1, 3)) %>% 
-  pivot_wider(names_from = type, values_from = count) %>% 
-  mutate(season = "Spring")
-
-Biotrack_spring_2 <- 
-  read_excel(here("Data", "Hyltemossa_20210524.xlsx")) %>% 
-  filter(!is.na(Date)) %>% 
-  select(Date, Time, starts_with("Ch"), FlowStatus, Laser_Status, Vol_L) %>% 
-  pivot_longer(cols = starts_with("Ch"), names_to = "Size_frac", values_to = "count") %>% 
-  mutate(type = case_when(grepl("Value", Size_frac) ~ "all",
-                          TRUE ~"bio")) %>% 
-  mutate(Size_frac = substr(Size_frac, 1, 3)) %>% 
-  pivot_wider(names_from = type, values_from = count) %>% 
-  mutate(season = "Spring")
-
-
-Biotrack <- 
-  bind_rows(list(Biotrack_fall_1,
-                           Biotrack_fall_2, 
-                           Biotrack_spring_1,
-                           Biotrack_spring_2)) %>% 
-  mutate(Date_Time = ymd_hms(paste(Date, 
-                                   substr(as.character(Time), 12, 19), 
-                                   sep = "_"))) %>% 
-  arrange(Date_Time)
-
-# interruption in the sampling
-Biotrack %>% 
-  mutate(time_plus1 = c(as.character(Biotrack$Date_Time[2:length(Biotrack$Date_Time)]), NA)) %>% 
-  mutate(time_plus1 = ymd_hms(time_plus1)) %>% 
-  mutate(diff = difftime(time_plus1, Date_Time)) %>% 
-  filter(diff > ms("0:400"))
-```
-
-
-```{r}
-Biotrack <- 
-Biotrack %>% 
-  filter(!Size_frac %in% c("Ch1", "Ch2")) %>% 
-  mutate(Date_Time = round_date(Date_Time, unit = "min")) %>% 
-  mutate(Date_Time_day = round_date(Date_Time, unit = "day")) %>% 
-  mutate(Date_Time_hour = round_date(Date_Time, unit = "hour")) %>% 
-  mutate(Size_frac = case_when(Size_frac == "Ch3" ~ "1-3µm",
-                               Size_frac == "Ch4" ~ "3-5µm",
-                               Size_frac == "Ch5" ~ "5-10µm",
-                               Size_frac == "Ch6" ~ "10-14µm")) 
-
-
-#pad dataframe with missing timepoints
-t_Fall <- tibble(
-  Date_Time = c(
-    seq(min(Biotrack[Biotrack$season == "Fall",]$Date_Time), 
-        max(Biotrack[Biotrack$season == "Fall",]$Date_Time), 
-        by = "mins"))) %>% 
-  mutate(season = "Fall")
-
-t_Spring <- tibble(
-  Date_Time = c(
-    seq(min(Biotrack[Biotrack$season == "Spring",]$Date_Time), 
-        max(Biotrack[Biotrack$season == "Spring",]$Date_Time), 
-        by = "mins"))) %>% 
-  mutate(season = "Spring")
-
-t_Biotrack <- bind_rows(t_Fall, t_Spring)
-```
-
-
-```{r}
-# it takes one observation every 5 minutes
-# 1 hour = 12 observations
-# 1 day = 288 observations
-
-Biotrack_plotdf <- 
-t_Biotrack %>% 
-  left_join(Biotrack) %>% 
-  mutate(Date = floor_date(Date_Time, unit = "day")) %>% 
-  mutate(bio = bio/Vol_L) %>%
-  left_join(Sun_time) %>% 
-  mutate(HMS = as_hms(Date_Time)) %>% 
-  group_by(Date) %>% 
-  mutate(daytime = case_when(HMS < sunrise ~ "night",
-                             HMS >= sunrise & HMS < sunset ~ "day",
-                             HMS >= sunset ~ "night",
-                             #Date_Time %within% interval(sunrise2, sunset) ~ "day",
-                             TRUE ~ NA_character_
-                             )) %>% 
-  #mutate(hour = rollmean(bio, 24, fill = NA, align = left)) %>% 
-  mutate(Size_frac = factor(Size_frac, levels = unique(.$Size_frac)[c(1,3,4,2)])) %>% 
-  group_by(season, Size_frac) %>% 
-  mutate(bio_h = rollapply(bio, width = 60, FUN = "mean", 
-                                               na.rm = TRUE, fill = NA,
-                                               partial = TRUE)) %>% 
-  mutate(bio_day = rollapply(bio, width = 720, FUN = "mean", 
-                                               na.rm = TRUE, fill = NA,
-                                               partial = FALSE))
-```
-
-
-```{r}
-Sun_time <- 
-Biotrack %>% 
-  select(Date) %>% 
-  distinct() %>% 
-  mutate(lat = 56.0976,
-         lon = 13.4189) %>% 
-  mutate(date = as.Date(Date)) %>% 
-  suncalc::getSunlightTimes(data = .) %>% 
-  dplyr::rename(Date = date) %>% 
-  select(Date, sunrise, sunset) %>% 
-  mutate(sunrise = as_hms(sunrise),
-         sunset = as_hms(sunset))
-
-Biotrack_dn <- 
-  Biotrack_plotdf %>% 
-  ungroup() %>% 
-  select(season, Date_Time, daytime) %>% 
-    mutate(group = data.table::rleid(daytime)) %>% 
-    group_by(group) %>% 
-    filter(row_number() == 1) %>%
-  ungroup() %>% 
-  mutate(end = lead(Date_Time)) %>% 
-  filter(end-Date_Time < lubridate::hms("24:00:00"))
-  
-
-Biotrack_plotdf %>%
-  filter(!is.na(bio)) %>% 
-  ggplot(aes(x = Date_Time))+
-  geom_rect(data = Biotrack_dn, 
-            aes(xmin=Date_Time, xmax=end, 
-    ymin=0.001, ymax=500, 
-    fill=daytime
-  ), alpha = 0.2)+
-  geom_line(size = 0.6, aes(y = bio_h, colour = Size_frac))+
- # geom_line(aes(y = bio_day, colour = Size_frac), size= 0.6)+
-  facet_wrap(~season, scales = "free_x", nrow = 2)+
-  scale_y_log10()+
-  theme_bw()+
-  labs(y = "Conc of bioaerosols per day (per L)")+
-  scale_fill_manual(values = c("#fdc500","#00296b"))+
-  scale_colour_brewer(palette = "Set1")
-
-
-```
-
-> https://doi.org/10.1089/089426803769017659
-
-Size fraction NGI (µm)
-(1) >8.06
-(2) 4.46-8.06
-(3) 2.8-4.46
-(4) 1.66-2.8
-(5) 0.94-1.66
-(6) 0.55-0.94
-(7) 0.34-0.55
-(8) <0.34
-
-Size fractions Biotrack (µm) (Channel 3,4,5 & 6)
-1-3, 3-5, 5-10, 10-14
-
-NGI 5,4 --> Ch3_VCNT (1-3 µm)
-NGI 3 --> Ch4_VCNT (3-5 µm)
-NGI 2,1 -->  Ch5_VCNT + Ch6_VCNT (5-10 & 10-16 µm)
-
-```{r}
-matched_path <- here("Data", "Matched_DNA_Biotrack.txt")
-if (file.exists(matched_path)) {
-  NGI_BT_match <- read_tsv(matched_path, show_col_types = FALSE)
-} else {
-  NGI_biotrack <- 
-  sample_meta %>% 
-    filter(Type == "NGI") %>% 
-    fuzzy_left_join( Biotrack,
-    by = c(
-      "Start_Date" = "Date_Time",
-      "End_Date" = "Date_Time"
-      ),
-    match_fun = list(`<=`, `>=`)
-    ) %>% 
-    group_by(Sample, Size_frac) %>% 
-    summarise(bio = sum(bio))
-
-  NGI_BT_match <- 
-  NGI_biotrack %>% 
-    pivot_wider(names_from = Size_frac, values_from = bio) %>% 
-    mutate(Ch5_6 = Ch5 + Ch6) %>% 
-    select(Sample, Ch3, Ch4, Ch5_6) %>% 
-    pivot_longer(-Sample, names_to = "BT_Size_frac", values_to = "count") %>% 
-    left_join(sample_meta) %>% 
-    select(Sample, BT_Size_frac, SizeFrac, count) %>% 
-    mutate(match = case_when(SizeFrac %in% c("1","2") & BT_Size_frac == "Ch5_6" ~ TRUE,
-                             SizeFrac == "3" & BT_Size_frac == "Ch4" ~ TRUE,
-                             SizeFrac %in% c("4","5") & BT_Size_frac == "Ch3" ~ TRUE,
-                             TRUE ~ FALSE
-                             )) %>% 
-    filter(match) 
-
-  write_tsv(NGI_BT_match, matched_path)
+  rare_df <- rarecurve(phylum_matrix, step = 200, tidy = TRUE)
+  rare_df$Phylum <- phylum_name
+  rarefaction_list[[phylum_name]] <- rare_df
 }
+
+rarefaction_df <- bind_rows(rarefaction_list) %>%
+  rename(size = Sample, Sample = Site)
+
+write_tsv(rarefaction_df, here(derived_dir, "rarefaction_curves.tsv"))
+
+rarefaction_df %>%
+  left_join(sample_metadata, by = "Sample") %>%
+  filter(Type == "NGI") %>%
+  ggplot(aes(size, Species, group = Sample, colour = season)) +
+  geom_line(alpha = 0.6) +
+  facet_wrap(~Phylum, scales = "free_y") +
+  scale_x_continuous(limits = c(0, 2e4)) +
+  scale_color_manual(values = c("#025196", "#FDB338")) +
+  labs(x = "Reads", y = "OTUs") +
+  theme(legend.position = "bottom")
+
+ggsave(here(fig_dir, "figure_rarefaction_curves.png"), width = 8, height = 5, dpi = 300)
 ```
 
-```{r}
-NGI_BT_match %>% 
-  mutate(SizeFrac = as.character(SizeFrac)) %>% 
-  left_join(DNA_conc) %>% 
-  left_join(sample_meta) %>% 
-  ggplot(aes(x = log10(count), y = DNA_C, colour = factor(SizeFrac)))+
-  geom_point()+
-  geom_smooth(method = "lm", se = F, size = 0.2)+
- # facet_wrap(season~SizeFrac, scales = "free",ncol = 5)+
-  theme_bw()+
-  scale_colour_brewer(palette = "Set1")+
-  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+## 9) Coverage-based richness estimates (iNEXT)
+
+This is one of the slower steps, so this chunk is cached.
+
+```{r diversity-estimates, cache=TRUE}
+diversity_estimate_list <- list()
+
+for (phylum_name in main_phyla) {
+  seq_ids <- taxonomy_table_clean %>%
+    filter(phylum == phylum_name) %>%
+    pull(seq)
+
+  phylum_matrix <- asv_matrix_clean[, intersect(seq_ids, colnames(asv_matrix_clean)), drop = FALSE]
+  phylum_matrix <- phylum_matrix[rowSums(phylum_matrix) > 0, , drop = FALSE]
+
+  if (ncol(phylum_matrix) == 0 || nrow(phylum_matrix) == 0) next
+
+  inext_out <- iNEXT::iNEXT(t(phylum_matrix), datatype = "abundance", q = 0, nboot = 10)
+
+  inext_df <- inext_out$iNextEst$coverage_based %>%
+    rename(Sample = Assemblage) %>%
+    group_by(Sample) %>%
+    filter(SC == 1) %>%
+    filter(m == max(m)) %>%
+    slice(1) %>%
+    ungroup() %>%
+    mutate(phylum = phylum_name)
+
+  diversity_estimate_list[[phylum_name]] <- inext_df
+}
+
+diversity_estimates <- bind_rows(diversity_estimate_list)
+
+write_tsv(diversity_estimates, path_diversity_output)
 ```
 
-```{r}
-NGI_BT_match %>% 
-  left_join(COI_div_exp_df) %>% 
-  filter(!is.na(phylum)) %>%
-  ggplot(aes(x = count, y = qD, colour = factor(SizeFrac)))+
-  geom_point()+
-  facet_grid(phylum~SizeFrac, scales = "free")+
-  theme_bw()+
-  scale_colour_brewer(palette = "Set1")+
-  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+We use the diversity table from the previous chunk for plotting and model summaries.
 
+```{r diversity-plots}
+diversity_plot_data <- diversity_estimates %>%
+  filter(phylum != "Chordata") %>%
+  left_join(sample_metadata, by = "Sample") %>%
+  filter(Type == "NGI")
 
-NGI_BT_match %>% 
-  left_join(COI_div_exp_df) %>% 
-  select(-SizeFrac) %>% 
-  left_join(sample_meta) %>% 
-  mutate()
-   mutate(SizeFrac = case_when(SizeFrac == 1 ~ ">8.06 µm",
-                               SizeFrac == 2 ~ "4.46-8.06 µm",
-                               SizeFrac == 3 ~ "2.8-4.46 µm",
-                               SizeFrac == 4 ~ "1.66-2.8 µm",
-                               SizeFrac == 5 ~ "0.94-1.66 µm",
-                               SizeFrac == 6 ~ "0.55-0.94 µm",
-                               SizeFrac == 7 ~ "0.34-0.55 µm",
-                               SizeFrac == 8 ~ "< 0.34 µm")) %>% 
-  filter(phylum != "Chordata") %>% 
-   ggplot(aes(x = count, y = qD, colour = factor(SizeFrac)))+
-  geom_point(alpha = 0.8, size = 0.8)+
-  facet_grid(phylum~season, scales = "free_y")+
-  theme_bw()+
-  geom_smooth(method = "lm", se = F, size = 0.2, aes(group = interaction(season, SizeFrac)))+
-  #geom_smooth(method = "lm", se = F, size = 0.8, aes(group = interaction(season, phylum), colour = season))+
-  scale_colour_brewer(palette = "Set1")+
-  scale_x_log10()+
-  scale_y_log10()
+diversity_plot <- diversity_plot_data %>%
+  ggplot(aes(SizeFrac, qD, colour = season)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_line(aes(group = Start_Date), alpha = 0.4, linewidth = 0.3) +
+  geom_smooth(aes(group = season), se = FALSE) +
+  facet_grid(phylum ~ ., scales = "free") +
+  scale_color_manual(values = c("#025196", "#FDB338")) +
+  labs(x = "Aerodynamic diameter D50 (um)", y = "OTU richness") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+diversity_plot
+
+ggsave(here(fig_dir, "figure_richness_by_size_fraction.png"), diversity_plot, width = 6, height = 7, dpi = 300)
+
+dna_vs_diversity_plot <- diversity_plot_data %>%
+  left_join(dna_concentration, by = "Sample") %>%
+  ggplot(aes(DNA_C, qD, colour = season)) +
+  geom_point(alpha = 0.8, size = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.2, aes(group = interaction(season, SizeFrac))) +
+  facet_grid(phylum ~ season, scales = "free_y") +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_manual(values = c("#025196", "#FDB338")) +
+  labs(x = "DNA concentration", y = "OTU richness")
+
+dna_vs_diversity_plot
+
+ggsave(here(fig_dir, "figure_dna_vs_richness.png"), dna_vs_diversity_plot, width = 7, height = 6, dpi = 300)
 ```
 
+```{r diversity-model}
+diversity_model <- diversity_plot_data %>%
+  left_join(dna_concentration, by = "Sample") %>%
+  lm(log(qD) ~ season + phylum + SizeFrac + log10(DNA_C), data = .)
 
-```{r}
-if (any(sample_meta$Type == "HighVol")) {
-  HighVol_biotrack <- 
-  sample_meta %>% 
+diversity_model_anova <- Anova(diversity_model, type = 2) %>%
+  tidy() %>%
+  mutate(across(where(is.numeric), ~ signif(.x, 3)))
+
+write_tsv(diversity_model_anova, here(derived_dir, "diversity_model_anova.tsv"))
+
+diversity_model_anova
+```
+
+## 10) NMDS and a simple sequence heatmap
+
+We visualize broad community composition and dominant sequence patterns.
+
+```{r nmds}
+asv_ngi_matrix <- asv_table_clean %>%
+  filter(str_detect(Sample, "^S")) %>%
+  column_to_rownames("Sample") %>%
+  as.matrix()
+
+asv_ngi_matrix <- asv_ngi_matrix[rowSums(asv_ngi_matrix) > 0, , drop = FALSE]
+asv_ngi_matrix <- asv_ngi_matrix[, colSums(asv_ngi_matrix) > 0, drop = FALSE]
+
+ngi_nmds <- vegan::metaMDS(asv_ngi_matrix, distance = "bray", autotransform = TRUE)
+
+nmds_points <- as_tibble(ngi_nmds$points, rownames = "Sample") %>%
+  left_join(sample_metadata, by = "Sample")
+
+write_tsv(nmds_points, here(derived_dir, "nmds_points.tsv"))
+
+nmds_plot <- nmds_points %>%
+  filter(SizeFrac != "< 0.37") %>%
+  ggplot(aes(MDS1, MDS2, colour = SizeFrac)) +
+  geom_point() +
+  facet_wrap(~season)
+
+nmds_plot
+
+ggsave(here(fig_dir, "figure_nmds.png"), nmds_plot, width = 7, height = 4, dpi = 300)
+```
+
+```{r heatmap-top-seq}
+top_sequences_per_sample <- asv_table_clean %>%
+  filter(str_detect(Sample, "^S")) %>%
+  pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>%
+  group_by(Sample) %>%
+  arrange(desc(reads), .by_group = TRUE) %>%
+  slice_head(n = 50) %>%
+  ungroup()
+
+heatmap_df <- asv_table_clean %>%
+  filter(Sample %in% unique(top_sequences_per_sample$Sample)) %>%
+  select(Sample, any_of(unique(top_sequences_per_sample$seq))) %>%
+  pivot_longer(-Sample, names_to = "seq", values_to = "reads") %>%
+  left_join(sample_metadata, by = "Sample") %>%
+  mutate(
+    Sample = fct_reorder(Sample, as.numeric(SizeFrac), .desc = TRUE),
+    seq = factor(seq)
+  )
+
+write_tsv(heatmap_df, here(derived_dir, "heatmap_top_sequences.tsv"))
+
+heatmap_plot <- heatmap_df %>%
+  ggplot(aes(Sample, seq, fill = log10(reads + 1))) +
+  geom_tile() +
+  facet_wrap(season ~ SizeFrac, scales = "free_x", ncol = 8) +
+  scale_fill_viridis_c(na.value = "white") +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+heatmap_plot
+
+ggsave(here(fig_dir, "figure_heatmap_top_sequences.png"), heatmap_plot, width = 12, height = 7, dpi = 300)
+```
+
+## 11) Prepare Biotrack time series
+
+We load and combine the four campaign files into one consistent table.
+
+```{r biotrack-prepare}
+biotrack_fall_raw <- bind_rows(biotrack_fall_1_raw, biotrack_fall_2_raw)
+biotrack_spring_raw <- bind_rows(biotrack_spring_1_raw, biotrack_spring_2_raw)
+
+biotrack_combined <- bind_rows(
+  biotrack_fall_raw %>% mutate(season = "Fall"),
+  biotrack_spring_raw %>% mutate(season = "Spring")
+) %>%
+  filter(!is.na(Date)) %>%
+  select(Date, Time, starts_with("Ch"), FlowStatus, Laser_Status, Vol_L, season) %>%
+  pivot_longer(cols = starts_with("Ch"), names_to = "Size_frac", values_to = "count") %>%
+  mutate(
+    type = case_when(str_detect(Size_frac, "Value") ~ "all", TRUE ~ "bio"),
+    Size_frac = str_sub(Size_frac, 1, 3)
+  ) %>%
+  pivot_wider(names_from = type, values_from = count) %>%
+  mutate(
+    Date_Time = ymd_hms(paste(Date, str_sub(as.character(Time), 12, 19), sep = "_")),
+    Date_Time = round_date(Date_Time, unit = "minute")
+  ) %>%
+  arrange(Date_Time) %>%
+  filter(!Size_frac %in% c("Ch1", "Ch2")) %>%
+  mutate(
+    Size_frac = recode(Size_frac, "Ch3" = "1-3um", "Ch4" = "3-5um", "Ch5" = "5-10um", "Ch6" = "10-14um"),
+    bio_per_l = bio / Vol_L,
+    Date = floor_date(Date_Time, unit = "day")
+  )
+
+write_tsv(biotrack_combined, here(derived_dir, "biotrack_combined.tsv"))
+```
+
+```{r biotrack-day-night}
+sun_table <- biotrack_combined %>%
+  distinct(Date) %>%
+  mutate(lat = 56.0976, lon = 13.4189, date = as.Date(Date)) %>%
+  suncalc::getSunlightTimes(data = .) %>%
+  transmute(
+    Date = date,
+    sunrise = hms::as_hms(sunrise),
+    sunset = hms::as_hms(sunset)
+  )
+
+biotrack_plot_data <- biotrack_combined %>%
+  left_join(sun_table, by = "Date") %>%
+  mutate(
+    HMS = hms::as_hms(Date_Time),
+    daytime = case_when(
+      HMS < sunrise ~ "night",
+      HMS >= sunrise & HMS < sunset ~ "day",
+      HMS >= sunset ~ "night",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  group_by(season, Size_frac) %>%
+  mutate(
+    bio_h = rollapply(bio_per_l, width = 60, FUN = mean, na.rm = TRUE, fill = NA, partial = TRUE),
+    bio_day = rollapply(bio_per_l, width = 720, FUN = mean, na.rm = TRUE, fill = NA, partial = FALSE)
+  ) %>%
+  ungroup()
+
+biotrack_daynight_blocks <- biotrack_plot_data %>%
+  filter(!is.na(daytime)) %>%
+  arrange(Date_Time) %>%
+  mutate(group = cumsum(daytime != lag(daytime, default = first(daytime)))) %>%
+  group_by(group, daytime) %>%
+  summarise(start = min(Date_Time), end = max(Date_Time), .groups = "drop") %>%
+  filter(end > start)
+
+biotrack_time_plot <- biotrack_plot_data %>%
+  ggplot(aes(Date_Time)) +
+  geom_rect(
+    data = biotrack_daynight_blocks,
+    aes(xmin = start, xmax = end, ymin = 0.001, ymax = 500, fill = daytime),
+    inherit.aes = FALSE,
+    alpha = 0.2
+  ) +
+  geom_line(aes(y = bio_h, colour = Size_frac), linewidth = 0.6) +
+  facet_wrap(~season, scales = "free_x", nrow = 2) +
+  scale_y_log10() +
+  scale_fill_manual(values = c("day" = "#FDC500", "night" = "#00296B")) +
+  labs(y = "Bioaerosol concentration per L", x = NULL, fill = NULL)
+
+biotrack_time_plot
+
+ggsave(here(fig_dir, "figure_biotrack_time_series.png"), biotrack_time_plot, width = 10, height = 5, dpi = 300)
+```
+
+## 12) Match NGI size fractions with Biotrack classes
+
+We use a precomputed match table if present; otherwise we build it from the time windows.
+
+```{r match-ngi-biotrack}
+if (!is.null(matched_dna_biotrack_existing)) {
+  matched_dna_biotrack <- matched_dna_biotrack_existing
+} else {
+  ngi_biotrack <- sample_metadata %>%
+    filter(Type == "NGI") %>%
+    fuzzy_left_join(
+      biotrack_combined,
+      by = c("Start_Date" = "Date_Time", "End_Date" = "Date_Time"),
+      match_fun = list(`<=`, `>=`)
+    ) %>%
+    group_by(Sample, Size_frac) %>%
+    summarise(bio = sum(bio, na.rm = TRUE), .groups = "drop")
+
+  matched_dna_biotrack <- ngi_biotrack %>%
+    pivot_wider(names_from = Size_frac, values_from = bio) %>%
+    mutate(Ch5_6 = `5-10um` + `10-14um`) %>%
+    select(Sample, `1-3um`, `3-5um`, Ch5_6) %>%
+    pivot_longer(-Sample, names_to = "BT_Size_frac", values_to = "count") %>%
+    left_join(sample_metadata %>% select(Sample, SizeFrac), by = "Sample") %>%
+    mutate(
+      match = case_when(
+        SizeFrac %in% c("8.83", "4.89") & BT_Size_frac == "Ch5_6" ~ TRUE,
+        SizeFrac == "3.09" & BT_Size_frac == "3-5um" ~ TRUE,
+        SizeFrac %in% c("1.82", "1.03") & BT_Size_frac == "1-3um" ~ TRUE,
+        TRUE ~ FALSE
+      )
+    ) %>%
+    filter(match)
+
+  write_tsv(matched_dna_biotrack, path_matched)
+}
+
+write_tsv(matched_dna_biotrack, here(derived_dir, "matched_dna_biotrack.tsv"))
+
+matched_dna_biotrack
+```
+
+```{r biotrack-dna-richness-plots}
+plot_dna_vs_biotrack <- matched_dna_biotrack %>%
+  left_join(dna_concentration, by = "Sample") %>%
+  left_join(sample_metadata, by = "Sample") %>%
+  ggplot(aes(log10(count), DNA_C, colour = SizeFrac)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.2) +
+  labs(x = "log10(Biotrack count)", y = "DNA concentration") +
+  scale_color_brewer(palette = "Set1")
+
+plot_dna_vs_biotrack
+
+ggsave(here(fig_dir, "figure_biotrack_vs_dna.png"), plot_dna_vs_biotrack, width = 6, height = 4, dpi = 300)
+
+plot_richness_vs_biotrack <- matched_dna_biotrack %>%
+  left_join(diversity_estimates, by = "Sample") %>%
+  filter(!is.na(phylum), phylum != "Chordata") %>%
+  left_join(sample_metadata, by = "Sample") %>%
+  ggplot(aes(count, qD, colour = SizeFrac)) +
+  geom_point(alpha = 0.8, size = 0.8) +
+  facet_grid(phylum ~ season, scales = "free_y") +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "Biotrack count", y = "OTU richness") +
+  scale_color_brewer(palette = "Set1")
+
+plot_richness_vs_biotrack
+
+ggsave(here(fig_dir, "figure_biotrack_vs_richness.png"), plot_richness_vs_biotrack, width = 7, height = 6, dpi = 300)
+```
+
+## 13) HighVol comparison (if HighVol metadata are available)
+
+This part is optional and only runs if HighVol samples exist in metadata.
+
+```{r highvol-optional}
+if (any(sample_metadata$Type == "HighVol")) {
+  highvol_biotrack <- sample_metadata %>%
     filter(Type == "HighVol") %>%
-    filter(!grepl("-", Sample)) %>% 
-    fuzzy_left_join( Biotrack,
-    by = c(
-      "Start_Date" = "Date_Time",
-      "End_Date" = "Date_Time"
-      ),
-    match_fun = list(`<=`, `>=`)
-    ) 
+    filter(!str_detect(Sample, "-")) %>%
+    fuzzy_left_join(
+      biotrack_combined,
+      by = c("Start_Date" = "Date_Time", "End_Date" = "Date_Time"),
+      match_fun = list(`<=`, `>=`)
+    ) %>%
+    group_by(Sample, Size_frac) %>%
+    summarise(bio = sum(bio, na.rm = TRUE), all_count = sum(all, na.rm = TRUE), .groups = "drop")
 
-  HighVol_biotrack <- 
-    HighVol_biotrack %>%
-    group_by(Sample, Size_frac) %>% 
-    summarise(bio = sum(bio), 
-              all = sum(all))
+  highvol_match <- highvol_biotrack %>%
+    select(-all_count) %>%
+    pivot_wider(names_from = Size_frac, values_from = bio) %>%
+    mutate(sum_count = `1-3um` + `3-5um` + `5-10um`) %>%
+    select(Sample, sum_count) %>%
+    left_join(sample_metadata, by = "Sample")
 
-  HighVol_BT_match <- 
-  HighVol_biotrack %>% 
-    select(-all) %>% 
-    pivot_wider(names_from = Size_frac, values_from = bio) %>% 
-    mutate(sum_count= Ch3 + Ch4 + Ch5) %>% 
-    select(Sample, sum_count) %>% 
-    left_join(sample_meta) 
+  write_tsv(highvol_match, here(derived_dir, "highvol_biotrack_match.tsv"))
+
+  highvol_dna_plot <- highvol_match %>%
+    left_join(dna_concentration, by = "Sample") %>%
+    ggplot(aes(sum_count, DNA_C, colour = season)) +
+    geom_point() +
+    scale_x_log10() +
+    labs(x = "Biotrack summed count", y = "DNA concentration")
+
+  ggsave(here(fig_dir, "figure_highvol_biotrack_vs_dna.png"), highvol_dna_plot, width = 6, height = 4, dpi = 300)
 } else {
-  HighVol_BT_match <- tibble(Sample = character(), sum_count = numeric(), season = character())
+  message("No HighVol samples in current metadata. Skipping HighVol section.")
 }
 ```
 
+## 14) Weather summaries
 
-```{r}
-HighVol_BT_match %>% 
-  left_join(DNA_conc) %>% 
-  ggplot(aes(x = sum_count, y = DNA_C, colour = season))+
-  geom_point()+
-  theme_bw()+
-  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))+
-  scale_x_log10()
+We clean weather inputs and make a simple wind-direction summary plot.
+
+```{r weather-clean}
+weather_30m <- weather_30m_raw %>%
+  select(Year, Month, Day, Hour, AT, RH, WS, WD) %>%
+  mutate(date = ymd(paste(Year, Month, Day)))
+
+precip_htm <- precip_raw %>%
+  select(date, time, P_1_1_1, Swin_1_2_1, Lwin_1_2_1, Sun_1_1_1, RH_1_1_1, Ta_1_1_1) %>%
+  setNames(c("date", "time", "precipitation", "radiation_SW", "radiation_LW", "sunshine_frac", "RH", "Temp")) %>%
+  slice(-1) %>%
+  mutate(across(-c(date, time), as.numeric))
+
+write_tsv(weather_30m, here(derived_dir, "weather_30m_clean.tsv"))
+write_tsv(precip_htm, here(derived_dir, "precipitation_clean.tsv"))
 ```
 
+```{r weather-wind-rose}
+wind_rose_df <- weather_30m %>%
+  filter(WS > 0, WS < 12) %>%
+  mutate(
+    WS = round(WS),
+    WD = cut_interval(WD, 8),
+    WD = factor(WD, labels = c("N", "NE", "E", "SE", "S", "SW", "W", "NW"))
+  ) %>%
+  count(Month, WS, WD, name = "freq")
 
+write_tsv(wind_rose_df, here(derived_dir, "wind_rose_counts.tsv"))
 
-```{r}
-HighVol_BT_match %>% 
-  left_join(COI_div_exp_df) %>% 
-  filter(!is.na(phylum)) %>% 
-  ggplot(aes(x = sum_count, y = qD, colour = season))+
-  geom_point()+
-  theme_bw()+
-  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))+
-  facet_grid(phylum ~ season, scales = "free")+
-  scale_x_log10()
-```
-
-#weather data
-
-```{r}
-weather_30 <- 
-  read_delim(here("Data", "ICOS", "My data cart", "ICOS_ATC_NRT_HTM_2021-02-01_2022-02-28_30.0_612.MTO"),
-                         delim = ";",
-                         skip = 38) %>% 
-  select(Year, Month, Day, Hour, AT, RH, WS, WD)
-```
-
-
-
-TIMESTAMP 	time instant, UTC 		
-`date` 	measurement date 		
-`time` 	measurement time 		
-`Swin_1_2_1` 	incoming shortwave radiation, net radiometer W m-2 	energy flux
-`Lwin_1_2_1` 	incoming long-wave radiation, net radiometer 	W m-2 	energy flux
-`P_1_1_1` 	precipitation (total) 	mm 	length
-`RH_1_1_1` 	relative humidity 	% 	portion
-`Sun_1_1_1` 	sunshine duration, sunshine sensor 	1 	portion
-`Ta_1_1_1` 	air temperature 	°C 	temperature
-```{r}
-precip_HM <- 
-  read_delim(here("Data", "ICOS", "SE-Htm_meteo_2020_CP_flag.txt"),
-                         delim = ",",
-                         skip = 0) %>% 
-  select(date, time, P_1_1_1, Swin_1_2_1, Lwin_1_2_1, Sun_1_1_1, RH_1_1_1, Ta_1_1_1) %>% 
-  `colnames<-`(c("date", "time", "precipitation", "radiation_SW", "radiation_LW",
-                 "Sunshine_frac", "RH", "Temp")) %>% 
-  dplyr::slice(-1) %>% 
-  mutate(across(.cols = !one_of("date", "time"), as.numeric))
-
-```
-
-```{r}
-weather_30 %>% mutate(date = ymd(paste(Year, Month, Day))) %>% 
-  pull(date) %>% range()
-```
-
-
-
-wind roses
-```{r}
-weather_30 %>% 
-  filter(WS > 0 & WS < 12) %>% 
-  mutate(WS = round(WS), WD = cut_interval(WD, 8)) %>% 
-  mutate(WD = factor(WD, labels = c("N", "NE", "E", "SE", "S", "SW","W", "NW"))) %>% 
-  group_by(WS, WD, Month) %>% 
-  summarise(Freq = n()) %>% 
-  ggplot(aes(x = WD, y = Freq, fill = WS))+
-  geom_bar(stat = "identity", )+
-  coord_polar(start = -0.4)+
-  scale_fill_viridis_c()+
+wind_rose_plot <- wind_rose_df %>%
+  ggplot(aes(WD, freq, fill = WS)) +
+  geom_col() +
+  coord_polar(start = -0.4) +
+  scale_fill_viridis_c() +
   facet_wrap(~Month)
+
+wind_rose_plot
+
+ggsave(here(fig_dir, "figure_wind_rose_by_month.png"), wind_rose_plot, width = 8, height = 6, dpi = 300)
 ```
 
-#primer_test
+## 15) Dry deposition trajectories
 
-```{r}
-test <- c("HV23","HV22","HV20","HV24","HV17","S17","S65","S18","S56","S11")
+We calculate a simple size-dependent dry deposition trajectory over 72 hours.
 
-ASV_COI_clean %>% 
-  filter(Sample %in% test) %>% 
-  pivot_longer(-Sample, names_to = "seq") %>% 
-  left_join(tax_COI_clean) %>% 
-   mutate(phylum = case_when(phylum %in% c("Arthropoda", "Ascomycota", "Basidiomycota") ~ phylum, is.na(phylum) & is.na(kingdom) ~ "NA", is.na(phylum) & kingdom == "Fungi" ~ "NA_Fungi", TRUE ~ "other")) %>% 
-  group_by(Sample, phylum) %>% 
-  summarise(value = sum(value)) %>% 
-  group_by(Sample) %>% 
-  mutate(value = signif(value/sum(value)*100,2)) %>% 
-  ggplot(aes(x = Sample, y = value, fill = phylum))+
-  geom_bar(position = "stack", stat = "identity" )+
-  scale_fill_viridis_d()
- 
+```{r deposition}
+colnames(deposition_raw) <- c("size", "speed", "distance")
 
-#tax_COI_clean
+deposition_over_time <- deposition_raw %>%
+  transmute(
+    size = as.character(size),
+    settling_speed = as.numeric(speed)
+  ) %>%
+  distinct() %>%
+  tidyr::crossing(sec = seq(0, 72 * 3600, 3600)) %>%
+  mutate(
+    hours = sec / 3600,
+    distance_m = pmin(settling_speed * sec / 1e6, 100),
+    wind_distance_km = sec * 5 / 1000
+  )
 
+write_tsv(deposition_over_time, here(derived_dir, "deposition_over_time.tsv"))
+
+deposition_plot <- deposition_over_time %>%
+  ggplot(aes(hours, distance_m, colour = factor(size), group = size)) +
+  geom_line() +
+  labs(
+    x = "Time (hours)",
+    y = "Settling distance (m)",
+    colour = "Particle size"
+  )
+
+ggsave(here(fig_dir, "figure_dry_deposition_over_time.png"), deposition_plot, width = 7, height = 4, dpi = 300)
+
+deposition_wind_plot <- deposition_over_time %>%
+  ggplot(aes(wind_distance_km, distance_m, colour = factor(size), group = size)) +
+  geom_line() +
+  labs(
+    x = "Horizontal travel distance at 5 m/s wind (km)",
+    y = "Settling distance (m)",
+    colour = "Particle size"
+  )
+
+ggsave(here(fig_dir, "figure_dry_deposition_with_wind.png"), deposition_wind_plot, width = 7, height = 4, dpi = 300)
 ```
 
+## 16) Session information
 
-```{r}
-
-deposition <- read_tsv(here("Data", "deposition_speed.txt"))
-
-colnames(deposition) <- c("size", "speed", "distance")
-
-deposition_df <- 
-deposition %>% 
-  select(size) %>%
-  mutate(size_n = as.numeric(as.factor(size))) %>% 
-  mutate(sec = 60*60*72) %>%
-  group_by(size, size_n) %>% 
-  tidyr::expand(sec = seq(0, sec, 60*60)) %>% 
-  left_join(deposition) %>% 
-  mutate(distance = speed * sec) %>% 
-  mutate(distance = distance/10^6) %>% 
-  mutate(distance = ifelse(distance > 100, 100, distance)) %>% 
-  mutate(hours = sec/3600)
-
-
-plot_dynamic_distribution <- function(particles) {
-  
-  deposition_df %>%
-    ggplot(aes(x = size_n, y = -distance, size = size))+
-    geom_point(colour = "#107ab0")+
-    geom_label(aes(x = size_n, y = -distance + 5, label = paste(size, " µm")), 
-               size = 4, colour = "black")+
-    gganimate::transition_time(hours)+
-    labs(title = paste(particles, "deposition distance (m) after {round(frame_time)} hours"),
-         y = "distance in meter", x = "") +
-    theme_minimal(base_size = 15)+
-    theme(axis.text.x = element_text(angle = 90))+
-    guides(size = "none")
-
-    
-}
-  
-dry_deposition <- plot_dynamic_distribution("")
-
-gganimate::anim_save(here("Figures", "dry_deposition.gif"), dry_deposition)
-```
-
-
-```{r}
-
-deposition_df_wind <- 
-  deposition_df %>% 
-  mutate(distance_x = size_n + sec*5) %>% 
-  mutate(distance_x = distance_x / 1000)
-
-max_x <-
-  deposition_df_wind %>% 
-  group_by(size) %>% 
-  filter(distance == max(distance)) %>% 
-  filter(sec == min(sec)) %>% 
-  select(size, distance_x) %>% 
-  dplyr::rename(distance_x_max = distance_x)
-
-plot_dynamic_distribution_wind <- function(particles) {
-  
-  deposition_df_wind %>%
-    left_join(max_x) %>% 
-    mutate(distance_x = ifelse(distance_x < distance_x_max, distance_x, distance_x_max)) %>% 
-    ggplot(aes(x = distance_x, y = -distance, size = size))+
-    geom_point(colour = "#107ab0")+
-    geom_label(aes(x = distance_x, y = -distance + 5, label = paste(size, " µm")), 
-               size = 4, colour = "black")+
-    gganimate::transition_time(hours)+
-    labs(title = paste(particles, "deposition distance (m) after {round(frame_time)} hours\nwind = 5 m/s"),
-         y = "distance in meter", x = "travelled distance in km") +
-    theme_minimal(base_size = 15)+
-    theme(axis.text.x = element_text(angle = 90))+
-    guides( size = "none")+
-    scale_size_area(breaks = deposition$size)+
-    gganimate::shadow_mark(past = T, future=F, alpha=0.1, exclude_layer = 2)
-
-    
-}
-  
-dry_deposition_wind <- plot_dynamic_distribution_wind("")
-gganimate::anim_save(here("Figures", "dry_deposition_wind.gif"), dry_deposition_wind)
+```{r session-info}
+sessionInfo()
 ```
